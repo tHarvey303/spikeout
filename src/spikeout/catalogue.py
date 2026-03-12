@@ -1,0 +1,215 @@
+"""Catalogue-mode spike detection over a list of sky positions."""
+
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Optional
+
+from .detect import detect, SpikeResult
+
+__all__ = ["CatalogueEntry", "catalogue_detect", "plot_catalogue"]
+
+
+@dataclass
+class CatalogueEntry:
+    """Detection result for a single catalogue source.
+
+    Attributes
+    ----------
+    ra, dec : float
+        Sky coordinates of the source (degrees).
+    cutout : ndarray or None
+        Raw image cutout centred on the source.  *None* if extraction failed.
+    result : SpikeResult or None
+        Spike-detection output.  *None* if detection failed or was skipped.
+    error : str or None
+        Error message if extraction or detection raised an exception.
+    """
+    ra: float
+    dec: float
+    cutout: Optional[np.ndarray]
+    result: Optional[SpikeResult]
+    error: Optional[str] = None
+
+
+def catalogue_detect(
+    coords,
+    image_path,
+    cutout_size=256,
+    hdu_index=0,
+    **detect_kw,
+) -> List[CatalogueEntry]:
+    """Run spike detection on a list of sky positions in a FITS image.
+
+    The FITS file is opened with memory-mapping so only the pixels that
+    fall inside the requested cutouts are read from disk.
+
+    Parameters
+    ----------
+    coords : sequence of (ra, dec) in degrees, or `~astropy.coordinates.SkyCoord`
+        Sky positions to process.
+    image_path : str or path-like
+        Path to the FITS image.
+    cutout_size : int
+        Side length of each square cutout in pixels.
+    hdu_index : int
+        Index of the HDU containing the image data and WCS.
+    **detect_kw
+        Forwarded to `~spikeout.detect.detect`.
+
+    Returns
+    -------
+    list of `CatalogueEntry`
+        One entry per input coordinate, in the same order.  Entries where
+        extraction or detection failed have ``result=None`` and a
+        non-empty ``error`` string.
+    """
+    try:
+        from astropy.io import fits
+        from astropy.wcs import WCS
+        from astropy.nddata import Cutout2D
+        from astropy.coordinates import SkyCoord
+    except ImportError:
+        raise ImportError(
+            "astropy is required for catalogue_detect. "
+            "Install with: pip install 'spikeout[astropy]'"
+        )
+
+    size = (cutout_size, cutout_size)
+
+    if not hasattr(coords, 'ra'):
+        coords = SkyCoord(
+            [c[0] for c in coords],
+            [c[1] for c in coords],
+            unit='deg',
+        )
+
+    entries = []
+    with fits.open(image_path, memmap=True) as hdul:
+        hdu = hdul[hdu_index]
+        wcs = WCS(hdu.header)
+        data = hdu.data  # memmap — pixels are not read until sliced
+
+        for sky in coords:
+            cutout_data = None
+            try:
+                cutout_obj = Cutout2D(
+                    data, sky, size, wcs=wcs,
+                    mode='partial', fill_value=np.nan,
+                    copy=True,
+                )
+                cutout_data = cutout_obj.data.astype(float)
+                result = detect(cutout_data, **detect_kw)
+                entries.append(CatalogueEntry(
+                    ra=float(sky.ra.deg),
+                    dec=float(sky.dec.deg),
+                    cutout=cutout_data,
+                    result=result,
+                ))
+            except Exception as exc:
+                entries.append(CatalogueEntry(
+                    ra=float(sky.ra.deg),
+                    dec=float(sky.dec.deg),
+                    cutout=cutout_data,
+                    result=None,
+                    error=str(exc),
+                ))
+
+    return entries
+
+
+def plot_catalogue(
+    entries,
+    ncols=5,
+    panel_size=3.0,
+    vmin_pct=1,
+    vmax_pct=99.5,
+):
+    """Grid plot of cutouts with detected spike lines overlaid.
+
+    Each panel shows the raw cutout image with detected spike lines drawn
+    over it.  Failed entries are shown as dark panels with the error message.
+
+    Parameters
+    ----------
+    entries : list of `CatalogueEntry`
+    ncols : int
+        Number of columns in the grid.
+    panel_size : float
+        Size of each panel in inches.
+    vmin_pct, vmax_pct : float
+        Percentile cuts for image stretch.
+
+    Returns
+    -------
+    fig : `~matplotlib.figure.Figure`
+    """
+    import matplotlib.pyplot as plt
+    from .geometry import radon_line_to_image
+
+    n = len(entries)
+    if n == 0:
+        raise ValueError("No entries to plot.")
+
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(panel_size * ncols, panel_size * nrows),
+        constrained_layout=True,
+    )
+    axes_flat = np.array(axes).ravel()
+
+    for idx, entry in enumerate(entries):
+        ax = axes_flat[idx]
+
+        if entry.cutout is None or entry.error:
+            ax.set_facecolor('0.15')
+            msg = entry.error or 'extraction failed'
+            if len(msg) > 60:
+                msg = msg[:57] + '...'
+            ax.text(
+                0.5, 0.5, msg,
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=6, color='salmon',
+            )
+        else:
+            finite = entry.cutout[np.isfinite(entry.cutout)]
+            vmin, vmax = np.percentile(finite, [vmin_pct, vmax_pct]) \
+                if finite.size > 0 else (0, 1)
+            ax.imshow(entry.cutout, origin='lower', cmap='gray',
+                      vmin=vmin, vmax=vmax)
+
+            res = entry.result
+            if res is not None and len(res.angles) > 0:
+                colors = plt.cm.Set1(np.linspace(0, 1, len(res.angles)))
+                for i in range(len(res.angles)):
+                    rho = res.rho_physical[i]
+                    th = res.theta[res.peak_theta_indices[i]]
+                    (x1, y1), (x2, y2), angle = radon_line_to_image(
+                        rho, th, entry.cutout.shape,
+                    )
+                    ax.plot([x1, x2], [y1, y2], '-',
+                            color=colors[i], lw=1.0, alpha=0.85)
+                    ax.text(
+                        0.02, 0.98 - i * 0.13,
+                        f"{angle:.0f}\u00b0  SNR={res.snr[i]:.1f}",
+                        transform=ax.transAxes,
+                        fontsize=6, color=colors[i], va='top',
+                    )
+            elif res is not None:
+                ax.text(
+                    0.5, 0.02, 'no spikes',
+                    ha='center', va='bottom', transform=ax.transAxes,
+                    fontsize=6, color='white', alpha=0.6,
+                )
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(
+            f"RA={entry.ra:.4f}  Dec={entry.dec:.4f}",
+            fontsize=6,
+        )
+
+    for idx in range(n, nrows * ncols):
+        axes_flat[idx].axis('off')
+
+    return fig
