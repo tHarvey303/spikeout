@@ -16,7 +16,8 @@ pip install -e ".[dev]"
 
 ## Example
 Here is an example of spikeout results on a real Euclid Q1 NISP image, showing the detected spikes and sinogram. The diagnostic plot shows the preprocessed image, the Radon sinogram, and the angular profile with detected peaks.
-<img src="examples/example.png"  alt="Example of spikeout results" width="600"/>
+
+<img src="examples/example.png"  alt="Example of spikeout results" width="800"/>
 
 
 ## Quick start
