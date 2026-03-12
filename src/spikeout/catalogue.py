@@ -49,8 +49,9 @@ def catalogue_detect(
         Sky positions to process.
     image_path : str or path-like
         Path to the FITS image.
-    cutout_size : int
-        Side length of each square cutout in pixels.
+    cutout_size : int or sequence of int
+        Side length of each square cutout in pixels.  Pass a sequence of
+        the same length as ``coords`` to use a different size per source.
     hdu_index : int
         Index of the HDU containing the image data and WCS.
     **detect_kw
@@ -74,8 +75,6 @@ def catalogue_detect(
             "Install with: pip install 'spikeout[astropy]'"
         )
 
-    size = (cutout_size, cutout_size)
-
     if not hasattr(coords, 'ra'):
         coords = SkyCoord(
             [c[0] for c in coords],
@@ -83,13 +82,19 @@ def catalogue_detect(
             unit='deg',
         )
 
+    sizes = (
+        [(s, s) for s in cutout_size]
+        if hasattr(cutout_size, '__len__')
+        else [(cutout_size, cutout_size)] * len(coords)
+    )
+
     entries = []
     with fits.open(image_path, memmap=True) as hdul:
         hdu = hdul[hdu_index]
         wcs = WCS(hdu.header)
         data = hdu.data  # memmap — pixels are not read until sliced
 
-        for sky in coords:
+        for sky, size in zip(coords, sizes):
             cutout_data = None
             try:
                 cutout_obj = Cutout2D(
