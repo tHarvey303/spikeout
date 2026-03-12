@@ -88,18 +88,20 @@ class TestDetectAngles:
 
 
 class TestRhoFilter:
-    """Tests for the ρ (centrality) filter."""
+    """Tests for the ρ (centrality) constraint applied during detection."""
 
-    def test_strict_rho_rejects_more(self, star_offset):
-        """Stricter ρ fraction should reject more peaks."""
+    def test_strict_rho_detects_fewer(self, star_offset):
+        """Stricter ρ constraint should detect fewer or equal peaks."""
         r_loose = detect(star_offset, max_rho_fraction=0.5, min_snr=0.0)
         r_strict = detect(star_offset, max_rho_fraction=0.02, min_snr=0.0)
-        assert r_strict.n_rejected_rho >= r_loose.n_rejected_rho
+        assert len(r_strict.angles) <= len(r_loose.angles)
 
-    def test_rho_fraction_one_passes_all(self, star_offset):
-        """max_rho_fraction=1.0 should reject nothing."""
-        result = detect(star_offset, max_rho_fraction=1.0, min_snr=0.0)
-        assert result.n_rejected_rho == 0
+    def test_detected_rho_within_band(self, star_offset):
+        """All detected peaks must have |ρ| within the requested band."""
+        frac = 0.2
+        result = detect(star_offset, max_rho_fraction=frac, min_snr=0.0)
+        max_rho_px = frac * min(star_offset.shape) / 2.0
+        assert (np.abs(result.rho_physical) <= max_rho_px + 1).all()
 
     def test_centred_star_small_rho(self, star_centred):
         """Centred star's real spikes should survive even a strict ρ filter.

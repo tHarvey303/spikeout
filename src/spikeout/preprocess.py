@@ -10,7 +10,9 @@ __all__ = ["prepare_image", "azimuthal_median", "find_centre"]
 
 
 def find_centre(image):
-    """Auto-detect source centre from the smoothed peak pixel.
+    """Detect source centre from the smoothed peak pixel.
+
+    Used when ``centre='auto'`` is passed to `prepare_image`.
 
     Parameters
     ----------
@@ -71,7 +73,7 @@ def azimuthal_median(image, centre=None, radial_bin_width=1):
 
 def prepare_image(
     image,
-    centre=None,
+    centre='center',
     radial_bin_width=2,
     morph_radius=3,
     sigma_clip=1.5,
@@ -93,9 +95,14 @@ def prepare_image(
     Parameters
     ----------
     image : 2-D array  (NaN-safe)
-    centre : (row, col) or *None*
-        Star centre for the azimuthal subtraction.  Auto-detected from
-        the brightest pixel if *None*.
+    centre : ``'center'`` | ``'auto'`` | (row, col)
+        Star centre for the azimuthal subtraction.
+
+        * ``'center'`` *(default)* — geometric centre of the cutout
+          ``(ny/2, nx/2)``.
+        * ``'auto'`` — detected from the smoothed peak pixel via
+          `find_centre`; useful when the star is not well centred.
+        * ``(row, col)`` — explicit coordinates.
     radial_bin_width : int
         Annular bin width (pixels) for the azimuthal median.
     morph_radius : int
@@ -114,7 +121,10 @@ def prepare_image(
     image = np.asarray(image, dtype=float).copy()
     image[~np.isfinite(image)] = 0.0
 
-    if centre is None:
+    if centre == 'center':
+        ny, nx = image.shape
+        centre = (ny / 2.0, nx / 2.0)
+    elif centre == 'auto':
         centre = find_centre(image)
 
     # 1. azimuthal median subtraction

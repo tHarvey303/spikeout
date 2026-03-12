@@ -93,8 +93,6 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
         ax.axvline(theta[ti], color="cyan", ls="--", lw=0.8, alpha=0.5)
 
     parts = ["Radon sinogram"]
-    if result.n_rejected_rho > 0:
-        parts.append(f"{result.n_rejected_rho} ρ-rej")
     if result.n_rejected_snr > 0:
         parts.append(f"{result.n_rejected_snr} SNR-rej")
     ax.set(

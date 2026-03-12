@@ -39,8 +39,6 @@ class SpikeResult:
         Sinogram column indices of accepted peaks.
     prepared_image : ndarray
         The preprocessed image that was fed to the Radon transform.
-    n_rejected_rho : int
-        Number of peaks rejected by the ρ (centrality) filter.
     n_rejected_snr : int
         Number of peaks rejected by the SNR significance filter.
     lengths : list of SpikeLengths or None
@@ -54,7 +52,6 @@ class SpikeResult:
     peak_rho_indices: np.ndarray
     peak_theta_indices: np.ndarray
     prepared_image: np.ndarray
-    n_rejected_rho: int = 0
     n_rejected_snr: int = 0
     lengths: Optional[List[SpikeLengths]] = None
 
@@ -116,15 +113,19 @@ def detect(
         ``(rho, theta)`` window for the 2-D local-maximum filter.
 
     max_rho_fraction : float
-        Maximum allowed ``|ρ|`` as a fraction of half the smallest image
-        dimension.  Rejects lines that don't pass near the image centre.
+        Maximum ``|ρ|`` as a fraction of half the smallest image
+        dimension that a line may have to be considered.  Diffraction
+        spikes pass through the image centre, so the sinogram is
+        restricted to this central ρ band *before* peak detection —
+        this prevents bright off-axis sources from winning the
+        per-angle competition and masking weaker on-axis spikes.
 
         Typical values::
 
             0.05 — strict, star must be well centred
             0.10 — default, allows slight miscentering
             0.20 — lenient, for poor centring or small cutouts
-            1.00 — effectively no filtering
+            1.00 — no restriction
 
     min_snr : float
         Minimum signal-to-noise ratio for a peak in the angular profile
@@ -150,7 +151,8 @@ def detect(
 
     **prep_kw
         Extra keyword arguments forwarded to
-        `~spikeout.preprocess.prepare_image` (``centre``,
+        `~spikeout.preprocess.prepare_image` (``centre`` —
+        ``'center'`` | ``'auto'`` | ``(row, col)``,
         ``radial_bin_width``, ``morph_radius``, ``sigma_clip``,
         ``asinh_stretch``).
 
@@ -182,12 +184,22 @@ def detect(
     sinogram = radon(prepared, theta=theta, circle=True)
     n_rho = sinogram.shape[0]
 
+    # ── centrality mask (applied during detection, not post-hoc) ─────────
+    # Diffraction spikes pass through the image centre, so we restrict
+    # the sinogram to the central ρ band before peak detection.  This
+    # prevents bright off-axis peaks from winning the per-angle competition
+    # and then being discarded, which would mask weaker on-axis spikes.
+    max_rho_px = max_rho_fraction * min(image.shape) / 2.0
+    all_rho_phys = sinogram_rho_to_physical(np.arange(n_rho), n_rho)
+    rho_central = np.abs(all_rho_phys) <= max_rho_px  # shape (n_rho,)
+    sinogram_central = sinogram * rho_central[:, np.newaxis]
+
     # ── 2-D peak detection ───────────────────────────────────────────────
-    abs_threshold = peak_prominence * np.max(sinogram)
+    abs_threshold = peak_prominence * np.max(sinogram_central)
     local_max = maximum_filter(sinogram, size=local_max_window)
     peak_map = (sinogram == local_max) & (sinogram > abs_threshold)
 
-    max_along_rho = np.max(sinogram * peak_map, axis=0)
+    max_along_rho = np.max(sinogram_central * peak_map, axis=0)
 
     min_sep_idx = max(1, int(np.round(
         min_peak_separation_deg / (180.0 / n_angles),
@@ -199,20 +211,11 @@ def detect(
     )
 
     peak_rho_idx = np.array(
-        [np.argmax(sinogram[:, ti]) for ti in peaks_1d],
+        [np.argmax(sinogram_central[:, ti]) for ti in peaks_1d],
     )
     rho_phys = sinogram_rho_to_physical(peak_rho_idx, n_rho).astype(float)
 
-    # ── filter 1: centrality (ρ) ─────────────────────────────────────────
-    max_rho_px = max_rho_fraction * min(image.shape) / 2.0
-    rho_mask = np.abs(rho_phys) <= max_rho_px
-    n_rejected_rho = int(np.sum(~rho_mask))
-
-    peaks_1d = peaks_1d[rho_mask]
-    peak_rho_idx = peak_rho_idx[rho_mask]
-    rho_phys = rho_phys[rho_mask]
-
-    # ── filter 2: significance (SNR) ─────────────────────────────────────
+    # ── filter: significance (SNR) ────────────────────────────────────────
     if len(peaks_1d) > 0 and min_snr > 0:
         snr_values = _angular_profile_snr(sinogram, peaks_1d)
         snr_mask = snr_values >= min_snr
@@ -247,7 +250,6 @@ def detect(
         peak_rho_indices=peak_rho_idx,
         peak_theta_indices=peaks_1d,
         prepared_image=prepared,
-        n_rejected_rho=n_rejected_rho,
         n_rejected_snr=n_rejected_snr,
     )
 

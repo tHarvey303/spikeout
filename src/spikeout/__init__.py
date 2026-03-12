@@ -5,6 +5,8 @@ from .lengths import measure_spike_lengths, SpikeLengths
 from .preprocess import prepare_image, azimuthal_median, find_centre
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .plotting import plot_diagnostics
+from .catalogue import catalogue_detect, plot_catalogue, CatalogueEntry
+from .regions import spike_box_regions, write_ds9_regions, write_catalogue_ds9_regions
 from .stats import mad_std
 
 __all__ = [
@@ -23,4 +25,12 @@ __all__ = [
     "sinogram_rho_to_physical",
     # plotting
     "plot_diagnostics",
+    # catalogue
+    "catalogue_detect",
+    "plot_catalogue",
+    "CatalogueEntry",
+    # regions
+    "spike_box_regions",
+    "write_ds9_regions",
+    "write_catalogue_ds9_regions",
 ]
