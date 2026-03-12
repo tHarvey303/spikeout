@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spikeout"
+version = "0.1.0"
+description = "Detect, measure, and mask diffraction spikes in astronomical images"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.9"
+authors = [
+    { name = "spikeout contributors" },
+]
+keywords = ["astronomy", "diffraction", "spikes", "PSF", "masking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy>=1.22",
+    "scikit-image>=0.19",
+    "scipy>=1.8",
+    "matplotlib>=3.5",
+]
+
+[project.optional-dependencies]
+astropy = ["astropy>=5.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "astropy>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/spikeout/spikeout"
+
+[tool.setuptools.packages.find]
+where = ["src"]

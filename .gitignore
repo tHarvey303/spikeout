@@ -1,0 +1,14 @@
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+*.ipynb_checkpoints
+.DS_Store
+*.log
+*.csv
+*.hdf5
+*.fits
+*.egg-info
