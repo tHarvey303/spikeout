@@ -8,6 +8,7 @@ import warnings
 
 
 from .detect import detect, SpikeResult
+from .regions import halo_mask as _halo_mask
 
 __all__ = ["CatalogueEntry", "catalogue_detect", "catalogue_summary", "plot_catalogue"]
 
@@ -31,6 +32,11 @@ class CatalogueEntry:
     wcs : WCS or None
         Astropy WCS for the cutout.  Populated when extraction succeeds;
         useful for accurate sky-coordinate region export.
+    halo_mask : ndarray or None
+        Boolean mask of the stellar halo, same shape as ``cutout``.
+        Populated when ``halo_mask_kw`` is passed to `catalogue_detect`.
+    halo_radius : float or None
+        Radius (pixels) of the halo mask.
     """
     ra: float
     dec: float
@@ -38,6 +44,8 @@ class CatalogueEntry:
     result: Optional[SpikeResult]
     error: Optional[str] = None
     wcs: Optional[object] = None
+    halo_mask: Optional[np.ndarray] = None
+    halo_radius: Optional[float] = None
 
     def __repr__(self) -> str:
         if self.error:
@@ -46,6 +54,8 @@ class CatalogueEntry:
             status = f"n_spikes={len(self.result.angles)}"
         else:
             status = "no_spikes"
+        if self.halo_radius is not None:
+            status += f", halo_r={self.halo_radius:.1f}px"
         return f"CatalogueEntry(ra={self.ra:.4f}, dec={self.dec:.4f}, {status})"
 
 
@@ -55,6 +65,7 @@ def catalogue_detect(
     cutout_size=256,
     hdu_index=0,
     n_jobs=1,
+    halo_mask_kw=None,
     **detect_kw,
 ) -> List[CatalogueEntry]:
     """Run spike detection on a list of sky positions in a FITS image.
@@ -78,6 +89,12 @@ def catalogue_detect(
         ``1`` (default) runs sequentially.  ``-1`` uses all available
         CPU threads.  Cutout extraction is always sequential because the
         FITS file is memory-mapped.
+    halo_mask_kw : dict or *None*
+        If provided, `~spikeout.regions.halo_mask` is called on each
+        cutout with these keyword arguments and the result is stored in
+        ``CatalogueEntry.halo_mask`` / ``CatalogueEntry.halo_radius``.
+        Pass an empty dict ``{}`` to use all defaults.  *None* (default)
+        skips halo masking entirely.
     **detect_kw
         Forwarded to `~spikeout.detect.detect`.
 
@@ -145,6 +162,15 @@ def catalogue_detect(
     # ── Phase 2: run detect (optionally parallel) ─────────────────────────
     entries = []
 
+    def _run_one(cutout_data):
+        """Run detect (and optionally halo_mask) on one cutout."""
+        result = detect(cutout_data, **detect_kw)
+        if halo_mask_kw is not None:
+            hmask, hradius = _halo_mask(cutout_data, **(halo_mask_kw or {}))
+        else:
+            hmask, hradius = None, None
+        return result, hmask, hradius
+
     if n_jobs == 1:
         for ra, dec, cutout_data, cutout_wcs, error in tqdm(
             raw, desc="Detecting spikes"
@@ -155,10 +181,11 @@ def catalogue_detect(
                 ))
             else:
                 try:
-                    result = detect(cutout_data, **detect_kw)
+                    result, hmask, hradius = _run_one(cutout_data)
                     entries.append(CatalogueEntry(
                         ra=ra, dec=dec, cutout=cutout_data,
                         result=result, wcs=cutout_wcs,
+                        halo_mask=hmask, halo_radius=hradius,
                     ))
                 except Exception as exc:
                     entries.append(CatalogueEntry(
@@ -167,13 +194,11 @@ def catalogue_detect(
                     ))
     else:
         from concurrent.futures import ThreadPoolExecutor
-        from functools import partial
-        _detect = partial(detect, **detect_kw)
         max_workers = None if n_jobs == -1 else n_jobs
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(_detect, cd) if error is None else None
+                executor.submit(_run_one, cd) if error is None else None
                 for _, _, cd, _, error in raw
             ]
 
@@ -191,9 +216,11 @@ def catalogue_detect(
                 ))
             else:
                 try:
+                    result, hmask, hradius = future.result()
                     entries.append(CatalogueEntry(
                         ra=ra, dec=dec, cutout=cd,
-                        result=future.result(), wcs=cwcs,
+                        result=result, wcs=cwcs,
+                        halo_mask=hmask, halo_radius=hradius,
                     ))
                 except Exception as exc:
                     entries.append(CatalogueEntry(
@@ -234,6 +261,9 @@ def catalogue_summary(entries) -> dict:
     ``lengths``
         1-D array of total lengths (pixels) for all measured spikes.
         Empty if no entry has ``result.lengths`` populated.
+    ``halo_radii``
+        1-D array of halo radii (pixels) for all entries where halo
+        masking was run.  Empty if no entry has ``halo_radius`` set.
     """
     total = len(entries)
     failed = sum(1 for e in entries if e.error is not None)
@@ -255,6 +285,9 @@ def catalogue_summary(entries) -> dict:
         if e.result is not None and e.result.lengths is not None
         for sl in e.result.lengths
     ])
+    all_halo_radii = np.array([
+        e.halo_radius for e in entries if e.halo_radius is not None
+    ])
 
     return {
         "total": total,
@@ -266,6 +299,7 @@ def catalogue_summary(entries) -> dict:
         "angles": all_angles,
         "snr": all_snr,
         "lengths": all_lengths,
+        "halo_radii": all_halo_radii,
     }
 
 
@@ -339,6 +373,15 @@ def plot_catalogue(
 
             ax.set_xlim(0, entry.cutout.shape[1])
             ax.set_ylim(0, entry.cutout.shape[0])
+
+            if entry.halo_radius is not None:
+                from matplotlib.patches import Circle
+                cx = entry.cutout.shape[1] / 2.0
+                cy = entry.cutout.shape[0] / 2.0
+                ax.add_patch(Circle(
+                    (cx, cy), entry.halo_radius,
+                    fill=False, edgecolor='cyan', lw=0.8, alpha=0.7,
+                ))
 
             res = entry.result
             if res is not None and len(res.angles) > 0:
