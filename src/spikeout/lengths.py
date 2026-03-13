@@ -395,7 +395,7 @@ def measure_spike_lengths(
     if centre is None:
         centre = find_centre(image)
 
-        if median_subtract:
+    if median_subtract:
         model = azimuthal_median(
             image, centre=centre, radial_bin_width=radial_bin_width,
         )
@@ -410,14 +410,12 @@ def measure_spike_lengths(
 
     if swath_width is None:
         swath_width = max(3.0, min(image.shape) * 0.02)
-    if min_run_pixels is None:
-        min_run_pixels = 3*swath_width
+
+    cy, cx = centre
+    ny, nx = img.shape
 
     img_diag = float(np.hypot(*image.shape))
-    if initial_radius is None:
-        # Ensure the first trial window extends well past the blank core so
-        # there is real spike signal to measure from the start.
-        initial_radius = max(min(image.shape) / 4.0, blank_r + swath_width * 2.0)
+
     if max_radius is None:
         max_radius = img_diag
 
