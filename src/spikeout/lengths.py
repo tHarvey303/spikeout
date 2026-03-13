@@ -43,6 +43,8 @@ class SpikeLengths:
     radii_neg: np.ndarray
     converged_pos: bool = True
     converged_neg: bool = True
+    popt: Optional[np.ndarray] = None
+    threshold: float = 0.0
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -482,6 +484,8 @@ def measure_spike_lengths(
             radii_neg=arm_results["neg"][1],
             converged_pos=arm_results["pos"][3],
             converged_neg=arm_results["neg"][3],
+            popt=popt,
+            threshold=threshold,
         ))
 
     return lengths
