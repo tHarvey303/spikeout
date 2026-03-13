@@ -3,10 +3,15 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional
+from tqdm import tqdm
+import warnings
+
 
 from .detect import detect, SpikeResult
 
 __all__ = ["CatalogueEntry", "catalogue_detect", "plot_catalogue"]
+
+warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 
 
 @dataclass
@@ -163,7 +168,7 @@ def plot_catalogue(
     )
     axes_flat = np.array(axes).ravel()
 
-    for idx, entry in enumerate(entries):
+    for idx, entry in tqdm(enumerate(entries), total=len(entries)):
         ax = axes_flat[idx]
 
         if entry.cutout is None or entry.error:
