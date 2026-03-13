@@ -1,10 +1,12 @@
-"""Measure the length of each diffraction-spike arm via swath profiles."""
+"""Measure the length of each diffraction-spike arm via Fraunhofer profile fitting."""
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional
-from .stats import mad_std
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+from scipy.ndimage import median_filter
+from scipy.optimize import curve_fit, root_scalar
 
+from .stats import mad_std
 from .preprocess import azimuthal_median, find_centre
 
 __all__ = ["SpikeLengths", "measure_spike_lengths"]
@@ -23,13 +25,13 @@ class SpikeLengths:
     length_total : float
         Sum of both arms.
     profile_pos, profile_neg : ndarray
-        Swath-median profile along each arm.
+        Median-smoothed swath profile along each arm (raw-image values).
     radii_pos, radii_neg : ndarray
-        Radial distance array for each arm.
+        Radial distance array for each arm (pixels from star centre).
     converged_pos, converged_neg : bool
-        True if the arm end was found within the measured profile.
-        False means the length was obtained by power-law extrapolation
-        and should be treated as an estimate.
+        True if the arm end was found as a threshold crossing within the
+        measured profile.  False means the endpoint was obtained by
+        extrapolating the fitted Fraunhofer envelope beyond the profile edge.
     """
     angle_deg: float
     length_pos: float
@@ -41,6 +43,31 @@ class SpikeLengths:
     radii_neg: np.ndarray
     converged_pos: bool = True
     converged_neg: bool = True
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _blank_core_radius(image, centre=None):
+    """Radius of the NaN/zero patch centred on ``centre``.
+
+    A saturated or masked star core is represented as NaN or exactly zero.
+    Returns 0.0 if the centre pixel is finite and non-zero.
+    """
+    ny, nx = image.shape
+    if centre is None:
+        cy, cx = ny / 2.0, nx / 2.0
+    else:
+        cy, cx = centre
+    cy_i, cx_i = int(round(cy)), int(round(cx))
+    if not (0 <= cy_i < ny and 0 <= cx_i < nx):
+        return 0.0
+    blank = ~np.isfinite(image) | (image == 0.0)
+    if not blank[cy_i, cx_i]:
+        return 0.0
+    Y, X = np.ogrid[:ny, :nx]
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    nearby = blank & (dist <= min(ny, nx) / 4.0)
+    return float(dist[nearby].max()) if nearby.any() else 0.0
 
 
 def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
@@ -112,207 +139,211 @@ def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
     return radii[:end], profile[:end]
 
 
-def _blank_core_radius(image, centre=None):
-    """Radius of the NaN/zero patch centred on ``centre``.
+# ── Fraunhofer profile model ──────────────────────────────────────────────────
 
-    A saturated or masked star core is represented as NaN or exactly zero.
-    This function measures how far that patch extends so callers can skip
-    the corrupted inner region of swath profiles.
+def _fraunhofer_model(r, a, b, c, alpha, d):
+    """Fraunhofer sinc² spike + power-law halo + constant background.
 
-    Returns 0.0 if the centre pixel is finite and non-zero.
+    ``a · sinc(b·r)²  +  c / r^alpha  +  d``
+
+    ``np.sinc`` is the normalised sinc: ``sin(π x) / (π x)``.
     """
-    ny, nx = image.shape
-    if centre is None:
-        cy, cx = ny / 2.0, nx / 2.0
-    else:
-        cy, cx = centre
-    cy_i, cx_i = int(round(cy)), int(round(cx))
-    if not (0 <= cy_i < ny and 0 <= cx_i < nx):
-        return 0.0
-    blank = ~np.isfinite(image) | (image == 0.0)
-    if not blank[cy_i, cx_i]:
-        return 0.0
-    Y, X = np.ogrid[:ny, :nx]
-    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-    nearby = blank & (dist <= min(ny, nx) / 4.0)
-    return float(dist[nearby].max()) if nearby.any() else 0.0
+    return a * np.sinc(b * r) ** 2 + c / r ** alpha + d
 
 
-def _find_arm_endpoint(profile, threshold, min_run_pixels, skip_before=0):
-    """Find the first run of ``min_run_pixels`` consecutive below-threshold points.
+def _log_fraunhofer_model(r, a, b, c, alpha, d):
+    """log₁₀ of ``_fraunhofer_model``, used for log-space curve_fit."""
+    val = _fraunhofer_model(r, a, b, c, alpha, d)
+    return np.log10(np.maximum(val, 1e-30))
+
+
+def _envelope_model(r, a, b, c, alpha, d):
+    """Upper envelope of the Fraunhofer spike model.
+
+    Replaces ``sinc(b·r)² ≤ 1/(π b r)²`` by its envelope, giving a
+    monotonically decreasing upper bound used for threshold crossing.
+    """
+    return a / (np.pi * b * r) ** 2 + c / r ** alpha + d
+
+
+def _estimate_p0(r, p):
+    """Estimate initial Fraunhofer model parameters from profile data."""
+    d0 = max(float(np.percentile(p, 5)), 1e-10)
+    a0 = max(float(np.percentile(p, 95)) - d0, d0)
+
+    # b0: sinc²(b·r) = 0.5 near b·r ≈ 0.6 → b ≈ 0.6 / r_half
+    p_above = p - d0
+    half_level = 0.5 * p_above.max()
+    candidates = r[p_above >= half_level]
+    r_half = float(candidates[-1]) if len(candidates) else float(r[len(r) // 4])
+    b0 = float(np.clip(0.6 / max(r_half, 1.0), 1e-5, 0.05))
+
+    # c0, alpha0: power-law fit to the last 20 % of points
+    n_tail = max(3, len(r) // 5)
+    r_tail = r[-n_tail:]
+    p_tail = np.maximum(p[-n_tail:] - d0, 1e-10)
+    try:
+        slope, intercept = np.polyfit(np.log(r_tail), np.log(p_tail), 1)
+        alpha0 = float(np.clip(-slope, 0.1, 3.0))
+        c0 = max(float(np.exp(intercept)), d0)
+    except Exception:
+        alpha0, c0 = 1.0, a0 * float(r[0])
+
+    return [a0, b0, c0, alpha0, d0]
+
+
+def _fit_spike_profile(
+    r_pos: np.ndarray,
+    p_pos: np.ndarray,
+    r_neg: np.ndarray,
+    p_neg: np.ndarray,
+    blank_r: float = 0.0,
+    smooth_size: int = 10,
+    r_min: Optional[float] = None,
+    r_max_fraction: float = 0.7,
+) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
+    """Smooth both arm profiles and fit a combined Fraunhofer+halo model.
+
+    Both arms are fit jointly in log₁₀ space to share model parameters,
+    giving a more robust estimate than fitting each arm independently.
 
     Parameters
     ----------
-    skip_before : int
-        Profile indices ``< skip_before`` are ignored for run counting.
-        Use this to skip the negative/NaN inner region produced by a
-        NaN/zero star core after azimuthal-median subtraction.
+    r_pos, p_pos : ndarray
+        Radii and raw-image swath-profile values for the positive arm.
+    r_neg, p_neg : ndarray
+        Same for the negative arm.
+    blank_r : float
+        Radius of any NaN/zero core to exclude from fitting.
+    smooth_size : int
+        Median-filter window applied before fitting.
+    r_min : float or *None*
+        Minimum radius included in the fit.  Defaults to ``blank_r``.
+    r_max_fraction : float
+        Upper fitting boundary as a fraction of each arm's profile length.
 
     Returns
     -------
-    endpoint_idx : int
-        Index of the arm endpoint in *profile*.
-    converged : bool
-        True if a qualifying run was found before the end of the profile.
+    popt : ndarray or *None*
+        Fitted parameters ``(a, b, c, alpha, d)``, or *None* on failure.
+    p_pos_smooth, p_neg_smooth : ndarray
+        Smoothed profiles (returned regardless of fit success).
     """
-    below = profile < threshold
-    run_length = 0
-    for j in range(len(below)):
-        if j < skip_before:
-            run_length = 0  # reset — blank-core region cannot terminate the arm
-            continue
-        if below[j]:
-            run_length += 1
-            if run_length >= min_run_pixels:
-                return j - int(min_run_pixels) + 1, True
-        else:
-            run_length = 0
-    return len(profile) - 1, False
+    sz = max(1, int(smooth_size))
+    p_pos_s = median_filter(p_pos, size=sz, mode='nearest') if sz > 1 else p_pos.copy()
+    p_neg_s = median_filter(p_neg, size=sz, mode='nearest') if sz > 1 else p_neg.copy()
 
+    fit_r_min = max(blank_r, r_min if r_min is not None else 1.0)
 
-def _extrapolate_arm_end(radii, profile, threshold, bg_level=0.0,
-                         min_fit_radius=0.0, min_fit_points=6):
-    """Estimate the arm end by fitting a power-law decay.
-
-    Fits ``profile[i] - bg ≈ A · r[i]^α`` (with α < 0) to the tail of the
-    profile in log-log space, then solves for the radius where the fit
-    crosses *threshold*.
-
-    Parameters
-    ----------
-    min_fit_radius : float
-        Only use profile points with ``radii >= min_fit_radius``.  Set to
-        the blank-core radius to exclude the corrupted inner segment.
-
-    Returns the extrapolated radius, or *None* if the fit is unreliable
-    (too few points, non-decaying trend, or non-finite result).
-    """
-    excess_profile = profile - bg_level
-    valid = (
-        np.isfinite(excess_profile)
-        & (excess_profile > 0)
-        & (radii >= min_fit_radius)
+    mask_pos = (
+        (r_pos > fit_r_min)
+        & (r_pos < r_max_fraction * float(r_pos[-1]))
+        & (p_pos_s > 0)
     )
-    if valid.sum() < min_fit_points:
-        return None
+    mask_neg = (
+        (r_neg > fit_r_min)
+        & (r_neg < r_max_fraction * float(r_neg[-1]))
+        & (p_neg_s > 0)
+    )
 
-    # Use the last min_fit_points valid points (the decay tail)
-    tail_idx = np.where(valid)[0][-min_fit_points:]
-    r_fit = radii[tail_idx]
-    p_fit = excess_profile[tail_idx]
+    r_comb = np.concatenate([r_pos[mask_pos], r_neg[mask_neg]])
+    p_comb = np.concatenate([p_pos_s[mask_pos], p_neg_s[mask_neg]])
 
-    if np.any(p_fit <= 0):
-        return None
+    if len(r_comb) < 6:
+        return None, p_pos_s, p_neg_s
 
-    # log(p) = log(A) + alpha * log(r)
+    p0 = _estimate_p0(r_comb, p_comb)
+    bounds = ([0, 1e-5, 0, 0.1, 0], [np.inf, 0.1, np.inf, 3.0, np.inf])
+
     try:
-        alpha, log_A = np.polyfit(np.log(r_fit), np.log(p_fit), 1)
-    except (np.linalg.LinAlgError, ValueError):
-        return None
-
-    # Require a decaying profile
-    if alpha >= 0:
-        return None
-
-    excess_thresh = threshold - bg_level
-    if excess_thresh <= 0:
-        return None
-
-    A = np.exp(log_A)
-    try:
-        r_extrap = (excess_thresh / A) ** (1.0 / alpha)
-    except (ZeroDivisionError, OverflowError, FloatingPointError):
-        return None
-
-    if not np.isfinite(r_extrap) or r_extrap <= 0:
-        return None
-
-    return float(r_extrap)
+        popt, _ = curve_fit(
+            _log_fraunhofer_model,
+            r_comb,
+            np.log10(p_comb),
+            p0=p0,
+            bounds=bounds,
+            maxfev=10000,
+        )
+        return popt, p_pos_s, p_neg_s
+    except (RuntimeError, ValueError, TypeError):
+        return None, p_pos_s, p_neg_s
 
 
-def _measure_arm_adaptive(
-    residual, x0, y0, arm_angle, swath_width,
-    threshold, min_run_pixels, bg_level,
-    initial_radius, max_radius, growth_factor,
-    blank_r=0.0,
-):
-    """Measure one spike arm with adaptive radius expansion.
+def _find_envelope_crossing(popt, threshold, r_max):
+    """Find the radius where the Fraunhofer envelope crosses *threshold*.
 
-    Starts the swath profile at ``initial_radius`` and multiplies by
-    ``growth_factor`` until the arm end drops below *threshold*, or
-    ``max_radius`` is reached.  At ``max_radius``, a power-law fit to the
-    profile tail provides an extrapolated estimate.
+    Uses Brent's method on a bracketed interval.
 
-    ``blank_r`` is the radius of any NaN/zero core at the star centre.
-    Profile points inside this radius are skipped when searching for the
-    arm endpoint and when fitting the power-law decay, because azimuthal-
-    median subtraction leaves them artificially negative.
-
-    Returns
-    -------
-    arm_length : float
-    radii : ndarray  (from the last trial radius)
-    profile : ndarray
-    converged : bool
+    Returns the crossing radius, or *None* if the envelope never drops
+    below *threshold* within ``[1 px, r_max]``.
     """
-    trial_r = initial_radius
-    radii = profile = None
+    a, b, c, alpha, d = popt
+    if threshold <= d:
+        return None
 
-    while True:
-        capped_r = min(trial_r, max_radius)
-        radii, profile = _extract_swath_profile(
-            residual, x0, y0, arm_angle, swath_width,
-            max_radius=capped_r,
-        )
+    def f(r):
+        return _envelope_model(r, a, b, c, alpha, d) - threshold
 
-        # Skip the blank-core segment when searching for the endpoint
-        skip_before = int(np.searchsorted(radii, blank_r))
-        endpoint_idx, converged = _find_arm_endpoint(
-            profile, threshold, min_run_pixels, skip_before=skip_before,
-        )
+    r_lo = max(1.0, 1.0 / (np.pi * b))  # near the first sinc² peak
+    if f(r_lo) <= 0:
+        return float(r_lo)
+    if f(r_max) > 0:
+        return float(r_max)  # still above threshold at image edge
 
-        if converged:
-            return float(radii[endpoint_idx]), radii, profile, True
+    try:
+        res = root_scalar(f, bracket=[r_lo, r_max], method='brentq')
+        return float(res.root) if res.converged else None
+    except ValueError:
+        return None
 
-        # Spike still above threshold at the edge — try to grow
-        if capped_r >= max_radius:
-            # At hard limit: extrapolate from the profile tail, excluding core
-            r_extrap = _extrapolate_arm_end(
-                radii, profile, threshold, bg_level,
-                min_fit_radius=blank_r,
-            )
-            if r_extrap is not None and r_extrap > radii[-1]:
-                return float(min(r_extrap, max_radius)), radii, profile, False
-            # Extrapolation failed — return the profile edge as a lower bound
-            return float(radii[-1]), radii, profile, False
 
-        trial_r = min(trial_r * growth_factor, max_radius)
+def _find_profile_crossing(radii, profile_smooth, threshold, blank_r=0.0):
+    """Return the radius where the smoothed profile first drops below *threshold*.
 
+    Skips the blank-core region (``r ≤ blank_r``) to avoid premature
+    termination from NaN/zero-core artefacts in the profile.
+
+    Returns ``(radius, True)`` on success, ``(None, False)`` if the profile
+    never crosses within its extent.
+    """
+    skip_before = int(np.searchsorted(radii, blank_r))
+    for j in range(skip_before, len(profile_smooth)):
+        if profile_smooth[j] < threshold:
+            return float(radii[j]), True
+    return None, False
+
+
+# ── public API ────────────────────────────────────────────────────────────────
 
 def measure_spike_lengths(
     image,
     result,
     swath_width=None,
     length_sigma=2.0,
-    min_run_pixels=None,
     centre=None,
     radial_bin_width=2,
-    initial_radius=None,
-    radius_growth_factor=1.5,
+    smooth_size=10,
+    r_min=None,
+    r_max_fraction=0.7,
     max_radius=None,
 ):
     """Measure the length of each detected spike arm.
 
-    Operates on the azimuthal-median-subtracted image so the measurement
-    captures where the *spike* fades, not the PSF halo.
+    Profiles are extracted along each arm from the **raw image** so the
+    full Fraunhofer + halo signal is available for fitting.  Both arms of
+    each spike are smoothed with a median filter, then jointly fitted in
+    log₁₀ space to the model
 
-    The swath profile is walked out to ``initial_radius`` first.  If the
-    spike has not ended by then the walk is extended by ``radius_growth_factor``
-    in successive steps until either the end is found or ``max_radius`` is
-    reached.  At ``max_radius`` a power-law extrapolation (fitting the
-    1/r^α profile tail) provides an estimated endpoint; the corresponding
-    ``converged`` flag in `SpikeLengths` is set to *False* so callers can
-    distinguish measured from extrapolated lengths.
+        ``f(r) = a · sinc(b r)²  +  c / r^α  +  d``
+
+    where the sinc² term captures the diffraction spike oscillations, the
+    power law captures the stellar halo, and ``d`` is the background floor.
+
+    The arm endpoint is where the smoothed profile first drops below a
+    background threshold.  If the spike extends to the profile edge without
+    crossing, the upper envelope ``a/(π b r)² + c/r^α + d`` is used to
+    extrapolate the crossing radius; ``SpikeLengths.converged_pos/neg`` is
+    set to *False* in that case.
 
     Parameters
     ----------
@@ -324,24 +355,24 @@ def measure_spike_lengths(
         Width (pixels) of the perpendicular sampling band.  Default:
         ``max(3, min(image.shape) * 0.02)``.
     length_sigma : float
-        The profile must drop below ``length_sigma × σ_bg`` to be
-        considered "at background".
-    min_run_pixels : float or *None*
-        Consecutive below-threshold samples required to declare the spike
-        has ended.  Default: ``swath_width``.
+        Arm endpoint threshold: ``background + length_sigma × σ_MAD``.
     centre : (row, col) or *None*
         Star centre.  Auto-detected if *None*.
     radial_bin_width : int
-        Annular bin width for the internal azimuthal subtraction.
-    initial_radius : float or *None*
-        Initial maximum swath-walk radius (pixels).  Default:
-        ``min(image.shape) / 4``.  Kept small to avoid the cost of
-        computing a long profile when spikes are short.
-    radius_growth_factor : float
-        Factor by which ``initial_radius`` is multiplied at each step
-        when the spike has not yet ended.  Default 1.5.
+        Annular bin width for background estimation.
+    smooth_size : int
+        Median-filter window applied to each arm profile before fitting
+        and threshold crossing.  Default 10.
+    r_min : float or *None*
+        Minimum radius included in the log-space fit.  Defaults to the
+        blank-core radius (so saturated/NaN cores are excluded).
+    r_max_fraction : float
+        Upper boundary of the fitting region as a fraction of the profile
+        length.  The noisy outer tail (beyond this fraction) is excluded
+        from the fit but used for the threshold crossing.  Default 0.7.
     max_radius : float or *None*
-        Hard upper limit on the walk radius.  Default: image diagonal.
+        Maximum swath-walk radius (pixels).  Defaults to the image
+        diagonal — set smaller to limit profile extraction cost.
 
     Returns
     -------
@@ -349,37 +380,37 @@ def measure_spike_lengths(
     """
     image = np.asarray(image, dtype=float)
 
-    # Measure blank-core radius from the original image before filling NaNs,
-    # so the corrupted inner segment of swath profiles can be skipped.
+    # Blank-core radius — needed to skip corrupted inner profile segment
     blank_r = _blank_core_radius(image, centre=centre)
 
-    image = image.copy()
-    image[~np.isfinite(image)] = 0.0
+    # Working copy with NaNs filled so swath sampling always has data
+    img = image.copy()
+    img[~np.isfinite(img)] = 0.0
 
     if centre is None:
-        centre = find_centre(image)
+        centre = find_centre(img)
 
-    model = azimuthal_median(
-        image, centre=centre, radial_bin_width=radial_bin_width,
-    )
-    residual = image - model
+    cy, cx = centre
+    ny, nx = img.shape
 
-    bg_level = 0.0  # residual is already background-subtracted
-    sigma_bg = mad_std(residual[np.isfinite(residual)])
-    threshold = length_sigma * sigma_bg
+    # Background threshold from the outer image annulus
+    if max_radius is None:
+        max_radius = float(np.hypot(ny, nx))
+
+    Y, X = np.ogrid[:ny, :nx]
+    R_img = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    bg_annulus = img[
+        (R_img > 0.7 * max_radius) & (R_img < max_radius) & np.isfinite(img)
+    ]
+    if bg_annulus.size < 4:
+        # Fallback: use full image statistics
+        bg_annulus = img[np.isfinite(img)]
+    bg_level = float(np.median(bg_annulus))
+    sigma_bg = float(mad_std(bg_annulus))
+    threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
 
     if swath_width is None:
-        swath_width = max(3.0, min(image.shape) * 0.02)
-    if min_run_pixels is None:
-        min_run_pixels = swath_width
-
-    img_diag = float(np.hypot(*image.shape))
-    if initial_radius is None:
-        # Ensure the first trial window extends well past the blank core so
-        # there is real spike signal to measure from the start.
-        initial_radius = max(min(image.shape) / 4.0, blank_r + swath_width * 2.0)
-    if max_radius is None:
-        max_radius = img_diag
+        swath_width = max(3.0, min(img.shape) * 0.02)
 
     theta = result.theta
     pk_th = result.peak_theta_indices
@@ -389,22 +420,49 @@ def measure_spike_lengths(
         rho = result.rho_physical[i]
         th_rad = np.deg2rad(theta[pk_th[i]])
 
-        # Closest point on Radon line → display coords
-        x0 = image.shape[1] / 2.0 + rho * np.cos(th_rad)
-        y0 = image.shape[0] / 2.0 - rho * np.sin(th_rad)
+        # Closest point on the Radon line → display coords
+        x0 = nx / 2.0 + rho * np.cos(th_rad)
+        y0 = ny / 2.0 - rho * np.sin(th_rad)
 
         angle = result.angles[i]
 
+        # Extract raw-image swath profiles for both arms
+        r_pos, p_pos = _extract_swath_profile(
+            img, x0, y0, angle, swath_width, max_radius=max_radius,
+        )
+        r_neg, p_neg = _extract_swath_profile(
+            img, x0, y0, (angle + 180.0) % 360.0, swath_width,
+            max_radius=max_radius,
+        )
+
+        # Fit combined Fraunhofer model; get smoothed profiles back
+        popt, p_pos_s, p_neg_s = _fit_spike_profile(
+            r_pos, p_pos, r_neg, p_neg,
+            blank_r=blank_r,
+            smooth_size=smooth_size,
+            r_min=r_min,
+            r_max_fraction=r_max_fraction,
+        )
+
+        # Per-arm endpoint: profile crossing first, envelope extrapolation second
         arm_results = {}
-        for sign, label in [(1.0, "pos"), (-1.0, "neg")]:
-            arm_angle = angle if sign > 0 else (angle + 180.0) % 360.0
-            arm_length, radii, profile, converged = _measure_arm_adaptive(
-                residual, x0, y0, arm_angle, swath_width,
-                threshold, min_run_pixels, bg_level,
-                initial_radius, max_radius, radius_growth_factor,
-                blank_r=blank_r,
+        for label, radii_arm, p_arm_s in [
+            ("pos", r_pos, p_pos_s),
+            ("neg", r_neg, p_neg_s),
+        ]:
+            r_cross, converged = _find_profile_crossing(
+                radii_arm, p_arm_s, threshold, blank_r=blank_r,
             )
-            arm_results[label] = (arm_length, radii, profile, converged)
+            if converged:
+                arm_results[label] = (r_cross, radii_arm, p_arm_s, True)
+            elif popt is not None:
+                r_extrap = _find_envelope_crossing(popt, threshold, float(radii_arm[-1]))
+                if r_extrap is not None:
+                    arm_results[label] = (r_extrap, radii_arm, p_arm_s, False)
+                else:
+                    arm_results[label] = (float(radii_arm[-1]), radii_arm, p_arm_s, False)
+            else:
+                arm_results[label] = (float(radii_arm[-1]), radii_arm, p_arm_s, False)
 
         lengths.append(SpikeLengths(
             angle_deg=angle,
