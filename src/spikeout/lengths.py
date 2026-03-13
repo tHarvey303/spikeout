@@ -276,6 +276,7 @@ def _measure_arm_adaptive(
 
         # Spike still above threshold at the edge — try to grow
         if capped_r >= max_radius:
+            #print(f"Reached max_radius={max_radius} without convergence; attempting extrapolation")
             # At hard limit: extrapolate from the profile tail, excluding core
             r_extrap = _extrapolate_arm_end(
                 radii, profile, threshold, bg_level,
@@ -300,6 +301,7 @@ def measure_spike_lengths(
     initial_radius=None,
     radius_growth_factor=1.5,
     max_radius=None,
+    median_subtract=False,
 ):
     """Measure the length of each detected spike arm.
 
@@ -328,7 +330,7 @@ def measure_spike_lengths(
         considered "at background".
     min_run_pixels : float or *None*
         Consecutive below-threshold samples required to declare the spike
-        has ended.  Default: ``swath_width``.
+        has ended.  Default: 10*``swath_width``.
     centre : (row, col) or *None*
         Star centre.  Auto-detected if *None*.
     radial_bin_width : int
@@ -342,6 +344,10 @@ def measure_spike_lengths(
         when the spike has not yet ended.  Default 1.5.
     max_radius : float or *None*
         Hard upper limit on the walk radius.  Default: image diagonal.
+    median_subtract : bool
+        If *True*, subtract the azimuthal median from the image before
+        measuring lengths.  This can help isolate the spike profile from the
+        PSF halo, but may not be desirable if the halo is very asymmetric.
 
     Returns
     -------
@@ -359,11 +365,13 @@ def measure_spike_lengths(
     if centre is None:
         centre = find_centre(image)
 
-    model = azimuthal_median(
-        image, centre=centre, radial_bin_width=radial_bin_width,
-    )
-    residual = image - model
-
+    if median_subtract:
+        model = azimuthal_median(
+            image, centre=centre, radial_bin_width=radial_bin_width,
+        )
+        residual = image - model
+    else:
+        residual = image
     bg_level = 0.0  # residual is already background-subtracted
     sigma_bg = mad_std(residual[np.isfinite(residual)])
     threshold = length_sigma * sigma_bg
@@ -371,7 +379,7 @@ def measure_spike_lengths(
     if swath_width is None:
         swath_width = max(3.0, min(image.shape) * 0.02)
     if min_run_pixels is None:
-        min_run_pixels = swath_width
+        min_run_pixels = 10*swath_width
 
     img_diag = float(np.hypot(*image.shape))
     if initial_radius is None:
