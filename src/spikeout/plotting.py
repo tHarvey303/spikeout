@@ -126,7 +126,11 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
     ax = axes[0, 3]
     finite = image[np.isfinite(image)]
     vmin, vmax = np.percentile(finite, [1, 99.5])
-    ax.imshow(image, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    from matplotlib.colors import Normalize, LogNorm
+    if vmin <= 0:
+        vmin = vmax/1e3
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+    ax.imshow(image, origin="lower", cmap="gray", norm=norm)
 
     colors = plt.cm.Set1(np.linspace(0, 1, max(n_spikes, 1)))
 
@@ -137,6 +141,7 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
             rho, th, image.shape,
         )
         color = colors[i % len(colors)]
+        color = 'red'
 
         label = f"{angle:.1f}° SNR={result.snr[i]:.1f}"
         if has_lengths:

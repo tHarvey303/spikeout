@@ -78,6 +78,7 @@ def prepare_image(
     morph_radius=3,
     sigma_clip=1.5,
     asinh_stretch=None,
+    subtract_median=False,
 ):
     """Preprocess an image to isolate diffraction spikes.
 
@@ -113,6 +114,9 @@ def prepare_image(
     asinh_stretch : float or *None*
         Stretch parameter for ``arcsinh(x / stretch)``.  Defaults to the
         median of the positive residual pixels (adaptive).
+    subtract_median : bool
+        If *True*, perform the azimuthal median subtraction step.  Set to
+        *False* to skip directly to sigma clipping, etc.
 
     Returns
     -------
@@ -127,17 +131,19 @@ def prepare_image(
     elif centre == 'auto':
         centre = find_centre(image)
 
-    # 1. azimuthal median subtraction
-    model = azimuthal_median(
-        image, centre=centre, radial_bin_width=radial_bin_width,
-    )
-    residual = image - model
-
+    if subtract_median:
+        # 1. azimuthal median subtraction
+        model = azimuthal_median(
+            image, centre=centre, radial_bin_width=radial_bin_width,
+        )
+        residual = image - model
+    else:
+        residual = image
     # 2. sigma clip
     sigma = mad_std(residual[np.isfinite(residual)])
     if sigma > 0:
         residual[residual < sigma_clip * sigma] = 0.0
-    residual = np.clip(residual, 0, None)
+        residual = np.clip(residual, 0, None)
 
     # 3. morphological opening
     if morph_radius > 0:
