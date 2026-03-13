@@ -264,10 +264,23 @@ def detect(
         distance=min_sep_idx,
     )
 
+    # Use the full sinogram to find the true brightest ρ at each detected
+    # angle — for a saturated star this is at the edge of the blank core.
     peak_rho_idx = np.array(
-        [np.argmax(sinogram_central[:, ti]) for ti in peaks_1d],
+        [np.argmax(sinogram[:, ti]) for ti in peaks_1d],
     )
     rho_phys = sinogram_rho_to_physical(peak_rho_idx, n_rho).astype(float)
+
+    # ── filter: closest approach to image centre ──────────────────────────
+    # Compute the perpendicular distance from the image centre to each
+    # candidate line (= |ρ|) and reject lines that lie outside the
+    # accepted band.  For a clean star |ρ| ≈ 0; for a saturated star
+    # max_rho_px has been extended by blank_r so peaks at the edge of
+    # the blank core survive this check.
+    central_mask = np.abs(rho_phys) <= max_rho_px
+    peaks_1d = peaks_1d[central_mask]
+    peak_rho_idx = peak_rho_idx[central_mask]
+    rho_phys = rho_phys[central_mask]
 
     # ── filter: significance (SNR) ────────────────────────────────────────
     if len(peaks_1d) > 0 and min_snr > 0:
