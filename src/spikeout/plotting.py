@@ -237,6 +237,7 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
                 xlabel="Radius (pixels)", ylabel="Swath median flux",
                 title=f"Spike @ {sl.angle_deg:.1f}°",
             )
-            ax.legend(fontsize=7)
+            ax.legend(fontsize=12)
+            ax.set_yscale("log")
 
     return fig

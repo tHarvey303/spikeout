@@ -320,6 +320,16 @@ def write_catalogue_ds9_regions(
                 f'{sky_pa:.2f})'
             )
 
+    # if we have halo measurements, add a circle region for the halo aperture
+    for entry in entries:
+        if entry.halo_radius is None:
+            continue
+
+        halo_r_arcsec = entry.halo_radius * scale
+        regions.append(
+            f'circle({entry.ra:.6f},{entry.dec:.6f},{halo_r_arcsec:.2f}")'
+        )
+
     _write_reg_file(path, "fk5", regions, colour)
 
 

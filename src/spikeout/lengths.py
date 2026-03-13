@@ -328,6 +328,7 @@ def measure_spike_lengths(
     r_min=None,
     r_max_fraction=0.7,
     max_radius=None,
+    median_subtract=False,
 ):
     """Measure the length of each detected spike arm.
 
@@ -375,6 +376,10 @@ def measure_spike_lengths(
     max_radius : float or *None*
         Maximum swath-walk radius (pixels).  Defaults to the image
         diagonal — set smaller to limit profile extraction cost.
+    median_subtract : bool
+        If *True*, subtract the azimuthal median from the image before
+        measuring lengths.  This can help isolate the spike profile from the
+        PSF halo, but may not be desirable if the halo is very asymmetric.
 
     Returns
     -------
@@ -390,29 +395,33 @@ def measure_spike_lengths(
     img[~np.isfinite(img)] = 0.0
 
     if centre is None:
-        centre = find_centre(img)
+        centre = find_centre(image)
 
-    cy, cx = centre
-    ny, nx = img.shape
+        if median_subtract:
+        model = azimuthal_median(
+            image, centre=centre, radial_bin_width=radial_bin_width,
+        )
+        residual = image - model
+    else:
+        residual = image
 
-    # Background threshold from the outer image annulus
-    if max_radius is None:
-        max_radius = float(np.hypot(ny, nx))
 
-    Y, X = np.ogrid[:ny, :nx]
-    R_img = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-    bg_annulus = img[
-        (R_img > 0.7 * max_radius) & (R_img < max_radius) & np.isfinite(img)
-    ]
-    if bg_annulus.size < 4:
-        # Fallback: use full image statistics
-        bg_annulus = img[np.isfinite(img)]
-    bg_level = float(np.median(bg_annulus))
-    sigma_bg = float(mad_std(bg_annulus))
-    threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
+    bg_level = 0.0  # residual is already background-subtracted
+    sigma_bg = mad_std(residual[np.isfinite(residual)])
+    threshold = length_sigma * sigma_bg
 
     if swath_width is None:
-        swath_width = max(3.0, min(img.shape) * 0.02)
+        swath_width = max(3.0, min(image.shape) * 0.02)
+    if min_run_pixels is None:
+        min_run_pixels = 3*swath_width
+
+    img_diag = float(np.hypot(*image.shape))
+    if initial_radius is None:
+        # Ensure the first trial window extends well past the blank core so
+        # there is real spike signal to measure from the start.
+        initial_radius = max(min(image.shape) / 4.0, blank_r + swath_width * 2.0)
+    if max_radius is None:
+        max_radius = img_diag
 
     theta = result.theta
     pk_th = result.peak_theta_indices

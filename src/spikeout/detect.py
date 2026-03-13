@@ -119,6 +119,7 @@ def _angular_profile_snr(sinogram, peak_theta_indices):
 
 def detect(
     image,
+    angle_image_fraction=1.0,
     # ── Radon grid ──
     angular_resolution=None,
     # ── peak finding ──
@@ -141,6 +142,14 @@ def detect(
     ----------
     image : 2-D array
         Input image (NaN-safe).
+
+    angle_image_fraction : float
+        Fraction of cutout size (from center) to use for spike angle
+        estimation.  Reducing this can help when the cutout contains
+        bright off-centre sources whose spikes would otherwise bias the
+        angle measurement.  Default: 1.0 (use the whole cutout). Using 
+        a large cutout will help for spike length and halo measurements,
+        but may hurt angle estimation if this argument is not tuned accordingly.
 
     angular_resolution : float or *None*
         Angular step in degrees.  Default: ``180 / max(image.shape)``.
@@ -223,6 +232,14 @@ def detect(
 
     # ── preprocessing ────────────────────────────────────────────────────
     prepared = prepare_image(image, **prep_kw)
+
+    # -- cropping for angle estimation ────────────────────────────────────
+    if angle_image_fraction < 1.0:
+        cy, cx = np.array(image.shape) / 2.0
+        half_size = angle_image_fraction * min(image.shape) / 2.0
+        y1, y2 = int(round(cy - half_size)), int(round(cy + half_size))
+        x1, x2 = int(round(cx - half_size)), int(round(cx + half_size))
+        prepared = prepared[y1:y2, x1:x2]
 
     # ── Radon transform ──────────────────────────────────────────────────
     if angular_resolution is None:
