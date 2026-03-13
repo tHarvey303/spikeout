@@ -7,6 +7,7 @@ from .stats import mad_std
 from .detect import detect
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .preprocess import azimuthal_median
+from .lengths import _fraunhofer_model, _envelope_model
 
 __all__ = ["plot_diagnostics"]
 
@@ -182,8 +183,6 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
 
     # ── Row 2: swath profiles ────────────────────────────────────────────
     if has_lengths:
-        sigma_bg = mad_std(image - azimuthal_median(image))
-
         for i in range(ncols_fig):
             ax = axes[1, i]
             if i >= n_spikes:
@@ -193,16 +192,46 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
             sl = result.lengths[i]
             color = colors[i % len(colors)]
 
-            ax.plot(sl.radii_pos, sl.profile_pos, "-", color=color,
-                    lw=1.2, label=f"+ arm ({sl.length_pos:.0f} px)")
-            ax.plot(sl.radii_neg, sl.profile_neg, "--", color=color,
-                    lw=1.2, label=f"− arm ({sl.length_neg:.0f} px)")
+            # Raw smoothed arm profiles
+            ax.semilogy(sl.radii_pos, np.maximum(sl.profile_pos, 1e-30),
+                        "-", color=color, lw=1.2,
+                        label=f"+ arm ({sl.length_pos:.0f} px"
+                              + ("" if sl.converged_pos else ", extrap") + ")")
+            ax.semilogy(sl.radii_neg, np.maximum(sl.profile_neg, 1e-30),
+                        "--", color=color, lw=1.2,
+                        label=f"− arm ({sl.length_neg:.0f} px"
+                              + ("" if sl.converged_neg else ", extrap") + ")")
 
-            ax.axhline(2.0 * sigma_bg, color="grey", ls=":", lw=1,
-                       label="2σ background")
+            # Fraunhofer fit + envelope
+            if sl.popt is not None:
+                r_all = np.concatenate([sl.radii_pos, sl.radii_neg])
+                r_dense = np.linspace(max(r_all.min(), 0.5), r_all.max(), 400)
+                fit_vals = _fraunhofer_model(r_dense, *sl.popt)
+                env_vals = _envelope_model(r_dense, *sl.popt)
+                ax.semilogy(r_dense, np.maximum(fit_vals, 1e-30),
+                            "-", color="0.35", lw=1.0, alpha=0.7,
+                            label="Fraunhofer fit")
+                ax.semilogy(r_dense, np.maximum(env_vals, 1e-30),
+                            ":", color="0.35", lw=1.0, alpha=0.7,
+                            label="Envelope")
 
-            ax.axvline(sl.length_pos, color=color, ls="-", lw=0.8, alpha=0.5)
-            ax.axvline(sl.length_neg, color=color, ls="--", lw=0.8, alpha=0.5)
+            # Detection threshold
+            if sl.threshold > 0:
+                ax.axhline(sl.threshold, color="grey", ls=":", lw=1,
+                           label=f"threshold ({sl.threshold:.2g})")
+
+            # Arm endpoint markers (filled = converged, open = extrapolated)
+            ymin_ax = ax.get_ylim()[0] if ax.get_ylim()[0] > 0 else 1e-30
+            for arm_len, ls, converged in [
+                (sl.length_pos, "-", sl.converged_pos),
+                (sl.length_neg, "--", sl.converged_neg),
+            ]:
+                ax.axvline(arm_len, color=color, ls=ls, lw=0.8, alpha=0.5)
+                marker = "o" if converged else "^"
+                if sl.threshold > 0:
+                    ax.plot(arm_len, sl.threshold, marker,
+                            color=color, ms=6,
+                            mfc=color if converged else "none", mew=1.5)
 
             ax.set(
                 xlabel="Radius (pixels)", ylabel="Swath median flux",
