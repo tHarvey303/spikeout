@@ -2,7 +2,12 @@
 
 import numpy as np
 
-__all__ = ["spike_box_regions", "write_ds9_regions", "write_catalogue_ds9_regions"]
+__all__ = [
+    "spike_box_regions",
+    "spike_mask",
+    "write_ds9_regions",
+    "write_catalogue_ds9_regions",
+]
 
 
 def _box_width(length_px, width_fraction, min_width, max_width):
@@ -12,6 +17,89 @@ def _box_width(length_px, width_fraction, min_width, max_width):
     if max_width is not None:
         w = min(w, max_width)
     return w
+
+
+def spike_mask(
+    result,
+    image_shape,
+    centre=None,
+    width_fraction=0.1,
+    min_width=5.0,
+    max_width=None,
+):
+    """Boolean mask with spike-contaminated pixels set to *True*.
+
+    The mask is computed by rasterising the same rotated-box geometry as
+    `spike_box_regions`, so it is exactly consistent with the DS9 output.
+
+    Requires ``result.lengths`` to be populated
+    (run `detect` with ``measure_lengths=True``).
+
+    Parameters
+    ----------
+    result : SpikeResult
+    image_shape : (int, int)
+        ``(nrows, ncols)`` of the image.
+    centre : (row, col) or None
+        Star centre in 0-indexed pixel coordinates.  Defaults to the
+        image centre.
+    width_fraction, min_width, max_width
+        Same semantics as `spike_box_regions`.
+
+    Returns
+    -------
+    mask : ndarray of bool, shape ``image_shape``
+    """
+    if result.lengths is None:
+        raise ValueError(
+            "result.lengths is None; run detect() with measure_lengths=True"
+        )
+
+    from skimage.draw import polygon as sk_polygon
+
+    nrows, ncols = image_shape
+    if centre is None:
+        cx, cy = ncols / 2.0, nrows / 2.0
+    else:
+        row, col = centre
+        cx, cy = float(col), float(row)
+
+    mask = np.zeros((nrows, ncols), dtype=bool)
+
+    for sl in result.lengths:
+        angle_rad = np.deg2rad(sl.angle_deg)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+
+        offset = (sl.length_pos - sl.length_neg) / 2.0
+        bx = cx + offset * cos_a
+        by = cy + offset * sin_a
+
+        half_len = sl.length_total / 2.0
+        half_wid = _box_width(sl.length_total, width_fraction, min_width, max_width) / 2.0
+
+        # 4 corners of the rotated box.
+        # Along-spike unit vector: (cos_a, sin_a)
+        # Perpendicular unit vector: (-sin_a, cos_a)
+        corners_x = np.array([
+            bx + half_len * cos_a - half_wid * sin_a,
+            bx + half_len * cos_a + half_wid * sin_a,
+            bx - half_len * cos_a + half_wid * sin_a,
+            bx - half_len * cos_a - half_wid * sin_a,
+        ])
+        corners_y = np.array([
+            by + half_len * sin_a + half_wid * cos_a,
+            by + half_len * sin_a - half_wid * cos_a,
+            by - half_len * sin_a - half_wid * cos_a,
+            by - half_len * sin_a + half_wid * cos_a,
+        ])
+
+        # skimage.draw.polygon uses (row, col); in our display frame
+        # (origin='lower') y_display == row_index, so no flip needed.
+        rr, cc = sk_polygon(corners_y, corners_x, shape=(nrows, ncols))
+        mask[rr, cc] = True
+
+    return mask
 
 
 def _sky_pa(display_angle_deg):

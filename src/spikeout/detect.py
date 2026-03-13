@@ -1,5 +1,6 @@
 """Core diffraction-spike detection via the Radon transform."""
 
+import warnings
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -55,6 +56,46 @@ class SpikeResult:
     n_rejected_snr: int = 0
     lengths: Optional[List[SpikeLengths]] = None
 
+    def __repr__(self) -> str:
+        n = len(self.angles)
+        if n == 0:
+            return "SpikeResult(no spikes detected)"
+        parts = [f"n={n}"]
+        parts.append("angles=[" + ", ".join(f"{a:.1f}\u00b0" for a in self.angles) + "]")
+        if self.lengths is not None:
+            parts.append(
+                "lengths=["
+                + ", ".join(f"{sl.length_total:.0f}px" for sl in self.lengths)
+                + "]"
+            )
+        return f"SpikeResult({', '.join(parts)})"
+
+
+def _central_blank_radius(image: np.ndarray) -> float:
+    """Estimate the radius of any NaN/zero patch at the image centre.
+
+    For a saturated star whose core has been set to 0 or NaN, the Radon
+    peak for a diffraction spike appears at the *edge* of that blank
+    region (ρ ≈ R_blank) rather than at ρ = 0.  This function returns
+    R_blank so the caller can extend the ρ acceptance band accordingly.
+
+    Returns 0 if the central pixel is finite and non-zero.
+    """
+    nrows, ncols = image.shape
+    cy, cx = nrows / 2.0, ncols / 2.0
+    cy_i, cx_i = int(round(cy)), int(round(cx))
+
+    blank = ~np.isfinite(image) | (image == 0.0)
+    if not blank[cy_i, cx_i]:
+        return 0.0
+
+    Y, X = np.ogrid[:nrows, :ncols]
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+
+    # Cap search to the inner quarter to ignore distant bad pixels
+    nearby = blank & (dist <= min(nrows, ncols) / 4.0)
+    return float(dist[nearby].max()) if nearby.any() else 0.0
+
 
 def _angular_profile_snr(sinogram, peak_theta_indices):
     """Compute the SNR of each peak in the max-over-ρ angular profile.
@@ -89,6 +130,7 @@ def detect(
     # ── optional length measurement ──
     measure_lengths=False,
     length_kw=None,
+    min_length=None,
     # ── preprocessing ──
     **prep_kw,
 ):
@@ -113,12 +155,14 @@ def detect(
         ``(rho, theta)`` window for the 2-D local-maximum filter.
 
     max_rho_fraction : float
-        Maximum ``|ρ|`` as a fraction of half the smallest image
-        dimension that a line may have to be considered.  Diffraction
-        spikes pass through the image centre, so the sinogram is
-        restricted to this central ρ band *before* peak detection —
-        this prevents bright off-axis sources from winning the
-        per-angle competition and masking weaker on-axis spikes.
+        A detected peak is accepted when its line passes within
+        ``max_rho_fraction × min(image.shape) / 2`` pixels of the
+        boundary of the central source.  For a clean star this is
+        equivalent to requiring ``|ρ| ≲ 0``.  For a saturated star
+        whose core is 0 or NaN the acceptance band is automatically
+        widened by the estimated blank-core radius so that the spike
+        arms — which peak at the edge of the saturated region rather
+        than at ρ = 0 — are still detected.
 
         Typical values::
 
@@ -148,6 +192,11 @@ def detect(
     length_kw : dict or *None*
         Extra keyword arguments forwarded to
         `~spikeout.lengths.measure_spike_lengths`.
+
+    min_length : float or *None*
+        Minimum total spike length in pixels.  Spikes shorter than this
+        are dropped after arm measurement.  Requires
+        ``measure_lengths=True``; a warning is issued if set otherwise.
 
     **prep_kw
         Extra keyword arguments forwarded to
@@ -184,12 +233,17 @@ def detect(
     sinogram = radon(prepared, theta=theta, circle=True)
     n_rho = sinogram.shape[0]
 
-    # ── centrality mask (applied during detection, not post-hoc) ─────────
-    # Diffraction spikes pass through the image centre, so we restrict
-    # the sinogram to the central ρ band before peak detection.  This
-    # prevents bright off-axis peaks from winning the per-angle competition
-    # and then being discarded, which would mask weaker on-axis spikes.
-    max_rho_px = max_rho_fraction * min(image.shape) / 2.0
+    # ── centrality mask ───────────────────────────────────────────────────
+    # Rather than imposing a hard limit on ρ, we require that the line
+    # corresponding to each peak passes within max_rho_fraction of the
+    # boundary of the central source.  For a clean star this is ρ ≈ 0.
+    # For a saturated star whose core is 0/NaN the spike arms produce
+    # Radon peaks at ρ ≈ R_blank (the edge of the blank region) — the
+    # line still passes through the star if extended, but the bright
+    # segment stops at the saturation boundary.  We automatically extend
+    # the accepted band by R_blank so these spikes are not missed.
+    blank_r = _central_blank_radius(image)
+    max_rho_px = max_rho_fraction * min(image.shape) / 2.0 + blank_r
     all_rho_phys = sinogram_rho_to_physical(np.arange(n_rho), n_rho)
     rho_central = np.abs(all_rho_phys) <= max_rho_px  # shape (n_rho,)
     sinogram_central = sinogram * rho_central[:, np.newaxis]
@@ -254,8 +308,28 @@ def detect(
     )
 
     # ── optional length measurement ──────────────────────────────────────
+    if min_length is not None and not measure_lengths:
+        warnings.warn(
+            "min_length has no effect when measure_lengths=False",
+            UserWarning,
+            stacklevel=2,
+        )
+
     if measure_lengths and len(peaks_1d) > 0:
         kw = length_kw or {}
         result.lengths = measure_spike_lengths(image, result, **kw)
+
+        if min_length is not None:
+            keep = np.array(
+                [i for i, sl in enumerate(result.lengths)
+                 if sl.length_total >= min_length],
+                dtype=int,
+            )
+            result.angles = result.angles[keep]
+            result.rho_physical = result.rho_physical[keep]
+            result.snr = result.snr[keep]
+            result.peak_rho_indices = result.peak_rho_indices[keep]
+            result.peak_theta_indices = result.peak_theta_indices[keep]
+            result.lengths = [result.lengths[i] for i in keep]
 
     return result

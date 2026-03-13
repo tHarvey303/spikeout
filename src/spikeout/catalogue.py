@@ -9,7 +9,7 @@ import warnings
 
 from .detect import detect, SpikeResult
 
-__all__ = ["CatalogueEntry", "catalogue_detect", "plot_catalogue"]
+__all__ = ["CatalogueEntry", "catalogue_detect", "catalogue_summary", "plot_catalogue"]
 
 warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 
@@ -28,12 +28,25 @@ class CatalogueEntry:
         Spike-detection output.  *None* if detection failed or was skipped.
     error : str or None
         Error message if extraction or detection raised an exception.
+    wcs : WCS or None
+        Astropy WCS for the cutout.  Populated when extraction succeeds;
+        useful for accurate sky-coordinate region export.
     """
     ra: float
     dec: float
     cutout: Optional[np.ndarray]
     result: Optional[SpikeResult]
     error: Optional[str] = None
+    wcs: Optional[object] = None
+
+    def __repr__(self) -> str:
+        if self.error:
+            status = f"error='{self.error[:40]}'"
+        elif self.result is not None and len(self.result.angles) > 0:
+            status = f"n_spikes={len(self.result.angles)}"
+        else:
+            status = "no_spikes"
+        return f"CatalogueEntry(ra={self.ra:.4f}, dec={self.dec:.4f}, {status})"
 
 
 def catalogue_detect(
@@ -41,6 +54,7 @@ def catalogue_detect(
     image_path,
     cutout_size=256,
     hdu_index=0,
+    n_jobs=1,
     **detect_kw,
 ) -> List[CatalogueEntry]:
     """Run spike detection on a list of sky positions in a FITS image.
@@ -59,6 +73,11 @@ def catalogue_detect(
         the same length as ``coords`` to use a different size per source.
     hdu_index : int
         Index of the HDU containing the image data and WCS.
+    n_jobs : int
+        Number of parallel worker threads for the detection step.
+        ``1`` (default) runs sequentially.  ``-1`` uses all available
+        CPU threads.  Cutout extraction is always sequential because the
+        FITS file is memory-mapped.
     **detect_kw
         Forwarded to `~spikeout.detect.detect`.
 
@@ -87,44 +106,167 @@ def catalogue_detect(
             unit='deg',
         )
 
+    if hasattr(cutout_size, '__len__') and len(cutout_size) != len(coords):
+        raise ValueError(
+            f"cutout_size has {len(cutout_size)} elements but coords has "
+            f"{len(coords)}"
+        )
+
     sizes = (
         [(s, s) for s in cutout_size]
         if hasattr(cutout_size, '__len__')
         else [(cutout_size, cutout_size)] * len(coords)
     )
 
-    entries = []
+    # ── Phase 1: extract cutouts (sequential, file must stay open) ────────
+    raw = []  # (ra, dec, cutout_data_or_None, cutout_wcs_or_None, error_or_None)
     with fits.open(image_path, memmap=True) as hdul:
         hdu = hdul[hdu_index]
-        wcs = WCS(hdu.header)
+        image_wcs = WCS(hdu.header)
         data = hdu.data  # memmap — pixels are not read until sliced
 
         for sky, size in zip(coords, sizes):
-            cutout_data = None
             try:
-                cutout_obj = Cutout2D(
-                    data, sky, size, wcs=wcs,
+                co = Cutout2D(
+                    data, sky, size, wcs=image_wcs,
                     mode='partial', fill_value=np.nan,
                     copy=True,
                 )
-                cutout_data = cutout_obj.data.astype(float)
-                result = detect(cutout_data, **detect_kw)
-                entries.append(CatalogueEntry(
-                    ra=float(sky.ra.deg),
-                    dec=float(sky.dec.deg),
-                    cutout=cutout_data,
-                    result=result,
+                raw.append((
+                    float(sky.ra.deg), float(sky.dec.deg),
+                    co.data.astype(float), co.wcs, None,
                 ))
             except Exception as exc:
-                entries.append(CatalogueEntry(
-                    ra=float(sky.ra.deg),
-                    dec=float(sky.dec.deg),
-                    cutout=cutout_data,
-                    result=None,
-                    error=str(exc),
+                raw.append((
+                    float(sky.ra.deg), float(sky.dec.deg),
+                    None, None, str(exc),
                 ))
 
+    # ── Phase 2: run detect (optionally parallel) ─────────────────────────
+    entries = []
+
+    if n_jobs == 1:
+        for ra, dec, cutout_data, cutout_wcs, error in tqdm(
+            raw, desc="Detecting spikes"
+        ):
+            if error is not None:
+                entries.append(CatalogueEntry(
+                    ra=ra, dec=dec, cutout=None, result=None, error=error,
+                ))
+            else:
+                try:
+                    result = detect(cutout_data, **detect_kw)
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cutout_data,
+                        result=result, wcs=cutout_wcs,
+                    ))
+                except Exception as exc:
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cutout_data,
+                        result=None, error=str(exc), wcs=cutout_wcs,
+                    ))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+        _detect = partial(detect, **detect_kw)
+        max_workers = None if n_jobs == -1 else n_jobs
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_detect, cd) if error is None else None
+                for _, _, cd, _, error in raw
+            ]
+
+        for (ra, dec, cd, cwcs, error), future in tqdm(
+            zip(raw, futures), total=len(raw), desc="Detecting spikes"
+        ):
+            if error is not None:
+                entries.append(CatalogueEntry(
+                    ra=ra, dec=dec, cutout=None, result=None, error=error,
+                ))
+            elif future is None:
+                entries.append(CatalogueEntry(
+                    ra=ra, dec=dec, cutout=cd, result=None,
+                    error="cutout extraction failed",
+                ))
+            else:
+                try:
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cd,
+                        result=future.result(), wcs=cwcs,
+                    ))
+                except Exception as exc:
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cd,
+                        result=None, error=str(exc), wcs=cwcs,
+                    ))
+
     return entries
+
+
+def catalogue_summary(entries) -> dict:
+    """Summarise detection results across a list of ``CatalogueEntry`` objects.
+
+    Parameters
+    ----------
+    entries : list of CatalogueEntry
+
+    Returns
+    -------
+    dict with keys:
+
+    ``total``
+        Number of input entries.
+    ``processed``
+        Entries where extraction succeeded (no error).
+    ``failed``
+        Entries where extraction or detection raised an exception.
+    ``with_spikes``
+        Processed entries that have at least one detected spike.
+    ``no_spikes``
+        Processed entries with no detected spikes.
+    ``n_spikes``
+        Total number of individual spike detections.
+    ``angles``
+        1-D array of all detected angles (degrees).
+    ``snr``
+        1-D array of SNR values for all detected spikes.
+    ``lengths``
+        1-D array of total lengths (pixels) for all measured spikes.
+        Empty if no entry has ``result.lengths`` populated.
+    """
+    total = len(entries)
+    failed = sum(1 for e in entries if e.error is not None)
+    processed = total - failed
+    with_spikes = sum(
+        1 for e in entries
+        if e.error is None and e.result is not None and len(e.result.angles) > 0
+    )
+
+    all_angles = np.array([
+        a for e in entries if e.result is not None for a in e.result.angles
+    ])
+    all_snr = np.array([
+        s for e in entries if e.result is not None for s in e.result.snr
+    ])
+    all_lengths = np.array([
+        sl.length_total
+        for e in entries
+        if e.result is not None and e.result.lengths is not None
+        for sl in e.result.lengths
+    ])
+
+    return {
+        "total": total,
+        "processed": processed,
+        "failed": failed,
+        "with_spikes": with_spikes,
+        "no_spikes": processed - with_spikes,
+        "n_spikes": len(all_angles),
+        "angles": all_angles,
+        "snr": all_snr,
+        "lengths": all_lengths,
+    }
 
 
 def plot_catalogue(
