@@ -32,6 +32,10 @@ class SpikeLengths:
         True if the arm end was found as a threshold crossing within the
         measured profile.  False means the endpoint was obtained by
         extrapolating the fitted Fraunhofer envelope beyond the profile edge.
+    popt : ndarray or None
+        Fitted Fraunhofer parameters ``(a, b, c, alpha, d)``.
+    threshold : float
+        Detection threshold used for arm endpoint measurement.
     """
     angle_deg: float
     length_pos: float
@@ -194,6 +198,89 @@ def _estimate_p0(r, p):
     return [a0, b0, c0, alpha0, d0]
 
 
+def _fit_shared_halo(
+    arm_data_list,
+    blank_r: float = 0.0,
+    smooth_size: int = 10,
+    r_min: Optional[float] = None,
+    r_max_fraction: float = 0.7,
+    halo_region_start: float = 0.4,
+) -> Optional[Tuple[float, float, float]]:
+    """Fit the shared PSF halo + background from all spike arms jointly.
+
+    The halo ``c / r^alpha + d`` is azimuthally symmetric, so all spike
+    arms from the same star share the same ``(c, alpha, d)``.  Fitting
+    these three parameters from all arms together gives a much more robust
+    estimate than trying to separate them per arm.
+
+    Uses the outer ``[halo_region_start, r_max_fraction]`` fraction of each
+    arm's profile, where the sinc² oscillations have largely decayed and the
+    signal is halo-dominated.
+
+    Parameters
+    ----------
+    arm_data_list : list of (r, p) tuples
+        All arm profiles to use (typically both arms of every spike).
+    blank_r, smooth_size, r_min, r_max_fraction
+        Same meaning as in `_fit_spike_profile`.
+    halo_region_start : float
+        Inner boundary of the halo-fitting window, as a fraction of each
+        arm's profile length.  Default 0.4 avoids the bright inner peak
+        where sinc² dominates.
+
+    Returns
+    -------
+    (c, alpha, d) : tuple of float, or *None* on failure
+    """
+    sz = max(1, int(smooth_size))
+    fit_r_min = max(blank_r, r_min if r_min is not None else 1.0)
+
+    r_all, p_all = [], []
+    for r, p in arm_data_list:
+        if len(r) < 4:
+            continue
+        p_s = median_filter(p, size=sz, mode='nearest') if sz > 1 else p.copy()
+        r_max_arm = float(r[-1])
+        r_lo = max(fit_r_min, halo_region_start * r_max_arm)
+        r_hi = r_max_fraction * r_max_arm
+        mask = (r > r_lo) & (r <= r_hi) & (p_s > 0)
+        if mask.sum() >= 3:
+            r_all.append(r[mask])
+            p_all.append(p_s[mask])
+
+    if not r_all:
+        return None
+
+    r_comb = np.concatenate(r_all)
+    p_comb = np.concatenate(p_all)
+
+    if len(r_comb) < 5:
+        return None
+
+    d0 = max(float(np.percentile(p_comb, 10)), 1e-10)
+    p_above = np.maximum(p_comb - d0, 1e-10)
+    try:
+        slope, intercept = np.polyfit(np.log(r_comb), np.log(p_above), 1)
+        alpha0 = float(np.clip(-slope, 0.1, 3.0))
+        c0 = max(float(np.exp(intercept)), d0)
+    except Exception:
+        alpha0, c0 = 1.5, float(np.median(p_comb))
+
+    def _log_halo(r, c, alpha, d):
+        return np.log10(np.maximum(c / r ** alpha + d, 1e-30))
+
+    try:
+        popt, _ = curve_fit(
+            _log_halo, r_comb, np.log10(p_comb),
+            p0=[c0, alpha0, d0],
+            bounds=([0.0, 0.1, 0.0], [np.inf, 3.0, np.inf]),
+            maxfev=5000,
+        )
+        return tuple(float(v) for v in popt)  # (c, alpha, d)
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+
 def _fit_spike_profile(
     r_pos: np.ndarray,
     p_pos: np.ndarray,
@@ -203,11 +290,15 @@ def _fit_spike_profile(
     smooth_size: int = 10,
     r_min: Optional[float] = None,
     r_max_fraction: float = 0.7,
+    shared_halo: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
     """Smooth both arm profiles and fit a combined Fraunhofer+halo model.
 
-    Both arms are fit jointly in log₁₀ space to share model parameters,
-    giving a more robust estimate than fitting each arm independently.
+    Both arms are fit jointly in log₁₀ space.  When ``shared_halo`` is
+    provided the halo parameters ``(c, alpha, d)`` are fixed, and only the
+    sinc² spike parameters ``(a, b)`` are free.  This gives a much better-
+    constrained fit for short profiles and when multiple spikes are present.
+    Falls back to the full 5-parameter fit if the constrained fit fails.
 
     Parameters
     ----------
@@ -223,6 +314,9 @@ def _fit_spike_profile(
         Minimum radius included in the fit.  Defaults to ``blank_r``.
     r_max_fraction : float
         Upper fitting boundary as a fraction of each arm's profile length.
+    shared_halo : (c, alpha, d) or *None*
+        Pre-fitted halo parameters shared across all spikes on this star.
+        When provided the fit has only 2 free parameters ``(a, b)``.
 
     Returns
     -------
@@ -254,6 +348,34 @@ def _fit_spike_profile(
     if len(r_comb) < 6:
         return None, p_pos_s, p_neg_s
 
+    # ── constrained fit: (a, b) only, halo fixed ──────────────────────────
+    if shared_halo is not None:
+        c_s, alpha_s, d_s = shared_halo
+
+        def _log_model_ab(r, a, b):
+            val = a * np.sinc(b * r) ** 2 + c_s / r ** alpha_s + d_s
+            return np.log10(np.maximum(val, 1e-30))
+
+        # Initial (a, b): subtract known halo, estimate from residual spike
+        p_spike = np.maximum(p_comb - c_s / r_comb ** alpha_s - d_s, 1e-10)
+        a0 = max(float(np.percentile(p_spike, 90)), 1e-10)
+        p_half = 0.5 * p_spike.max()
+        cands = r_comb[p_spike >= p_half]
+        r_half = float(cands[-1]) if len(cands) else float(r_comb[len(r_comb) // 4])
+        b0 = float(np.clip(0.6 / max(r_half, 1.0), 1e-5, 0.05))
+
+        try:
+            (a_fit, b_fit), _ = curve_fit(
+                _log_model_ab, r_comb, np.log10(p_comb),
+                p0=[a0, b0],
+                bounds=([0.0, 1e-5], [np.inf, 0.1]),
+                maxfev=5000,
+            )
+            return np.array([a_fit, b_fit, c_s, alpha_s, d_s]), p_pos_s, p_neg_s
+        except (RuntimeError, ValueError, TypeError):
+            pass  # fall through to unconstrained fit
+
+    # ── unconstrained fit: all 5 parameters ───────────────────────────────
     p0 = _estimate_p0(r_comb, p_comb)
     bounds = ([0, 1e-5, 0, 0.1, 0], [np.inf, 0.1, np.inf, 3.0, np.inf])
 
@@ -299,19 +421,35 @@ def _find_envelope_crossing(popt, threshold, r_max):
         return None
 
 
-def _find_profile_crossing(radii, profile_smooth, threshold, blank_r=0.0):
-    """Return the radius where the smoothed profile first drops below *threshold*.
+def _find_profile_crossing(
+    radii,
+    profile_smooth,
+    threshold,
+    blank_r: float = 0.0,
+):
+    """Return the first radius after the last above-threshold point.
 
-    Skips the blank-core region (``r ≤ blank_r``) to avoid premature
-    termination from NaN/zero-core artefacts in the profile.
+    Skips the blank-core region (``r ≤ blank_r``) and finds the last radius
+    where the smoothed profile is at or above *threshold*, then returns the
+    next radius as the endpoint.
 
-    Returns ``(radius, True)`` on success, ``(None, False)`` if the profile
-    never crosses within its extent.
+    This is inherently robust to sinc² oscillation troughs: a temporary dip
+    below threshold that later recovers simply moves ``last_above`` forward,
+    so the trough is never mistaken for the arm end.
+
+    Returns ``(radius, True)`` when the profile drops and stays below
+    *threshold* within the measured extent.  Returns ``(None, False)`` if the
+    profile is still above *threshold* at the outermost measured radius
+    (spike reaches the profile edge without converging).
     """
     skip_before = int(np.searchsorted(radii, blank_r))
-    for j in range(skip_before, len(profile_smooth)):
-        if profile_smooth[j] < threshold:
-            return float(radii[j]), True
+    above = np.where(profile_smooth[skip_before:] >= threshold)[0]
+    if len(above) == 0:
+        # Profile never rises above threshold beyond blank_r
+        return float(radii[skip_before]), True
+    last_above = above[-1] + skip_before
+    if last_above + 1 < len(radii):
+        return float(radii[last_above + 1]), True
     return None, False
 
 
@@ -342,11 +480,16 @@ def measure_spike_lengths(
     where the sinc² term captures the diffraction spike oscillations, the
     power law captures the stellar halo, and ``d`` is the background floor.
 
+    The halo parameters ``(c, alpha, d)`` are the same for all spikes on a
+    given star (azimuthal symmetry of the PSF), so they are fitted once from
+    all arms combined before the per-spike ``(a, b)`` fit.  This significantly
+    improves robustness for short profiles and for stars with many spikes.
+
     The arm endpoint is where the smoothed profile first drops below a
-    background threshold.  If the spike extends to the profile edge without
-    crossing, the upper envelope ``a/(π b r)² + c/r^α + d`` is used to
-    extrapolate the crossing radius; ``SpikeLengths.converged_pos/neg`` is
-    set to *False* in that case.
+    background threshold **and** the Fraunhofer envelope also predicts the
+    spike has ended (preventing sinc² oscillation troughs from being mistaken
+    for the end).  If the spike extends to the profile edge, the envelope is
+    used to extrapolate; ``SpikeLengths.converged_pos/neg`` is *False* then.
 
     Parameters
     ----------
@@ -402,13 +545,14 @@ def measure_spike_lengths(
             image, centre=centre, radial_bin_width=radial_bin_width,
         )
         residual = image - model
+        bg_level = 0.0
     else:
         residual = image
+        # Sky background from image median — robust because most pixels are sky.
+        bg_level = float(np.median(img[np.isfinite(img)]))
 
-
-    bg_level = 0.0  # residual is already background-subtracted
     sigma_bg = mad_std(residual[np.isfinite(residual)])
-    threshold = length_sigma * sigma_bg
+    threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
 
     if swath_width is None:
         swath_width = max(3.0, min(image.shape) * 0.02)
@@ -416,26 +560,21 @@ def measure_spike_lengths(
     cy, cx = centre
     ny, nx = img.shape
 
-    img_diag = float(np.hypot(*image.shape))
-
     if max_radius is None:
-        max_radius = img_diag
+        max_radius = float(np.hypot(ny, nx))
 
     theta = result.theta
     pk_th = result.peak_theta_indices
 
-    lengths = []
+    # ── Pass 1: extract all arm profiles ─────────────────────────────────
+    arm_profiles = []
     for i in range(len(result.angles)):
         rho = result.rho_physical[i]
         th_rad = np.deg2rad(theta[pk_th[i]])
-
-        # Closest point on the Radon line → display coords
         x0 = nx / 2.0 + rho * np.cos(th_rad)
         y0 = ny / 2.0 - rho * np.sin(th_rad)
-
         angle = result.angles[i]
 
-        # Extract raw-image swath profiles for both arms
         r_pos, p_pos = _extract_swath_profile(
             img, x0, y0, angle, swath_width, max_radius=max_radius,
         )
@@ -443,17 +582,38 @@ def measure_spike_lengths(
             img, x0, y0, (angle + 180.0) % 360.0, swath_width,
             max_radius=max_radius,
         )
+        arm_profiles.append((r_pos, p_pos, r_neg, p_neg, x0, y0, angle))
 
-        # Fit combined Fraunhofer model; get smoothed profiles back
+    # ── Shared halo fit: (c, alpha, d) from all arms jointly ─────────────
+    # The PSF halo is azimuthally symmetric, so these parameters are the
+    # same for every spike arm.  Fitting from all arms gives far more data
+    # than any single arm and makes the 5-parameter per-spike fit tractable.
+    all_arm_data = [
+        (r, p)
+        for (r_pos, p_pos, r_neg, p_neg, *_) in arm_profiles
+        for r, p in [(r_pos, p_pos), (r_neg, p_neg)]
+    ]
+    shared_halo = _fit_shared_halo(
+        all_arm_data,
+        blank_r=blank_r,
+        smooth_size=smooth_size,
+        r_min=r_min,
+        r_max_fraction=r_max_fraction,
+    )
+
+    # ── Pass 2: per-spike fit and model-aware endpoint detection ──────────
+    lengths = []
+    for r_pos, p_pos, r_neg, p_neg, x0, y0, angle in arm_profiles:
+
         popt, p_pos_s, p_neg_s = _fit_spike_profile(
             r_pos, p_pos, r_neg, p_neg,
             blank_r=blank_r,
             smooth_size=smooth_size,
             r_min=r_min,
             r_max_fraction=r_max_fraction,
+            shared_halo=shared_halo,
         )
 
-        # Per-arm endpoint: profile crossing first, envelope extrapolation second
         arm_results = {}
         for label, radii_arm, p_arm_s in [
             ("pos", r_pos, p_pos_s),
