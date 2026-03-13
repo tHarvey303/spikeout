@@ -282,6 +282,9 @@ def write_catalogue_ds9_regions(
 
     for entry in entries:
         if entry.result is None or entry.result.lengths is None:
+            if entry.result.lengths is None:
+                print(f"Warning: entry {entry} has result.lengths = None; skipping")
+            
             continue
 
         dec_rad = np.deg2rad(entry.dec)

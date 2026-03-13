@@ -349,14 +349,15 @@ def plot_catalogue(
                     (x1, y1), (x2, y2), angle = radon_line_to_image(
                         rho, th, entry.cutout.shape,
                     )
-                    ax.plot([x1, x2], [y1, y2], '-',
-                            color=colors[i], lw=1.0, alpha=0.85)
+                    ax.plot([x1, x2], [y1, y2],
+                            color='red', lw=1.0, alpha=0.85, linestyle='dotted')
+                    '''
                     ax.text(
                         0.02, 0.98 - i * 0.13,
                         f"{angle:.0f}\u00b0  SNR={res.snr[i]:.1f}",
                         transform=ax.transAxes,
                         fontsize=6, color=colors[i], va='top',
-                    )
+                    '''
             elif res is not None:
                 ax.text(
                     0.5, 0.02, 'no spikes',
