@@ -203,7 +203,9 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
                               + ("" if sl.converged_neg else ", extrap") + ")")
 
             # Fix ylims to avoid autoscaling to the noise floor in long arms
-            ax.set_ylim(ax.get_ylim()[0], ax.get_ylim()[1])
+
+            low = 0.1*threshold if sl.threshold > 0 else 1e-4
+            ax.set_ylim(low, ax.get_ylim()[1])
 
             # Fraunhofer fit + envelope
             if sl.popt is not None:
