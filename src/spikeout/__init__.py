@@ -6,7 +6,7 @@ from .preprocess import prepare_image, azimuthal_median, find_centre
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .plotting import plot_diagnostics
 from .catalogue import catalogue_detect, catalogue_summary, plot_catalogue, CatalogueEntry
-from .regions import spike_box_regions, spike_mask, write_ds9_regions, write_catalogue_ds9_regions
+from .regions import spike_box_regions, spike_mask, write_ds9_regions, write_catalogue_ds9_regions, halo_mask
 from .stats import mad_std
 
 __all__ = [
@@ -35,4 +35,5 @@ __all__ = [
     "spike_mask",
     "write_ds9_regions",
     "write_catalogue_ds9_regions",
+    "halo_mask",
 ]

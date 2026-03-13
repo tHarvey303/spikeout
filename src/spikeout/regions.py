@@ -1,12 +1,14 @@
-"""DS9 region file generation for detected diffraction spikes."""
+"""DS9 region file generation and pixel masks for diffraction spikes and halos."""
 
 import numpy as np
+from .stats import mad_std
 
 __all__ = [
     "spike_box_regions",
     "spike_mask",
     "write_ds9_regions",
     "write_catalogue_ds9_regions",
+    "halo_mask",
 ]
 
 
@@ -316,6 +318,143 @@ def write_catalogue_ds9_regions(
             )
 
     _write_reg_file(path, "fk5", regions, colour)
+
+
+def halo_mask(
+    image,
+    centre=None,
+    threshold_nsigma=3.0,
+    background_min_r_frac=0.6,
+    min_radius=5.0,
+    max_radius=None,
+    radial_bin_width=1.0,
+    smooth_bins=5,
+):
+    """Boolean circular mask enclosing the stellar halo.
+
+    Builds a robust azimuthal-median radial profile (immune to diffraction
+    spikes and neighbouring sources) and finds the outermost radius at which
+    the profile exceeds a background-noise threshold.
+
+    The threshold is ``background_level + threshold_nsigma × σ_MAD``, where
+    both quantities are estimated from an outer annulus of the image using
+    median / MAD statistics, making them robust to contamination.
+
+    Parameters
+    ----------
+    image : 2-D array
+        Input image (NaN-safe).
+    centre : (row, col) or None
+        Star centre in 0-indexed pixel coordinates.  Defaults to the image
+        centre.
+    threshold_nsigma : float
+        Halo edge is where the azimuthal-median profile drops to
+        ``bg_level + threshold_nsigma × σ_MAD``.  Typical values:
+
+            2.0  — lenient, captures faint extended wings
+            3.0  — default, good balance
+            5.0  — conservative, only the bright core
+    background_min_r_frac : float
+        Inner radius of the background annulus as a fraction of
+        *max_radius*.  Pixels at radius ``> background_min_r_frac ×
+        max_radius`` are used for background estimation.  Increase if the
+        stellar halo extends to the image edge.  Default 0.6.
+    min_radius : float
+        Minimum mask radius in pixels.  Prevents the mask from collapsing
+        for very faint or unresolved sources.  Default 5.
+    max_radius : float or None
+        Maximum allowed radius in pixels.  Defaults to the distance from
+        the centre to the nearest image edge.
+    radial_bin_width : float
+        Width of each annular bin in pixels.  Default 1.
+    smooth_bins : int
+        Window size (in bins) for a 1-D median filter applied to the
+        radial profile before thresholding.  Suppresses single-bin
+        excursions from noise or a neighbour source occupying a small
+        fraction of an annulus.  Default 5.
+
+    Returns
+    -------
+    mask : ndarray of bool, shape (nrows, ncols)
+        True inside the halo aperture.
+    radius_px : float
+        The measured halo radius in pixels.
+
+    Notes
+    -----
+    The azimuthal median is computed independently at each radial bin, so
+    a neighbouring source affects only bins where it occupies more than
+    half the annulus area — typically none for sources well separated from
+    the target.  For sources very close to the target, increase
+    *threshold_nsigma* or provide a custom *centre*.
+    """
+    from scipy.ndimage import median_filter as _median_filter
+
+    nrows, ncols = image.shape
+    img = np.asarray(image, dtype=float)
+
+    if centre is None:
+        cy, cx = nrows / 2.0, ncols / 2.0
+    else:
+        cy, cx = float(centre[0]), float(centre[1])
+
+    Y, X = np.mgrid[:nrows, :ncols]
+    R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+
+    if max_radius is None:
+        max_radius = float(min(cy, cx, nrows - cy, ncols - cx))
+    max_radius = max(max_radius, min_radius + 1.0)
+
+    # ── Background estimation ─────────────────────────────────────────────
+    # Outer annulus; MAD is robust to any remaining halo or neighbour flux.
+    bg_inner = background_min_r_frac * max_radius
+    bg_px = img[(R >= bg_inner) & (R < max_radius) & np.isfinite(img)]
+    if bg_px.size < 20:
+        bg_px = img[np.isfinite(img)]   # fallback for very small images
+    bg_level = float(np.median(bg_px))
+    bg_sigma = float(mad_std(bg_px))
+    threshold = bg_level + threshold_nsigma * bg_sigma
+
+    # ── Azimuthal-median radial profile ───────────────────────────────────
+    # Median per concentric annulus; a single-source neighbour biases the
+    # result only when it covers > 50 % of the annulus — very unlikely for
+    # r much larger than the neighbour's PSF.
+    bins = np.arange(0.0, max_radius + radial_bin_width, radial_bin_width)
+    n_bins = len(bins) - 1
+    r_centers = 0.5 * (bins[:-1] + bins[1:])
+
+    r_flat = R.ravel()
+    img_flat = img.ravel()
+    finite_flat = np.isfinite(img_flat)
+
+    # Initialise profile to bg_level so empty/sparse bins don't trigger a
+    # spurious detection.
+    profile = np.full(n_bins, bg_level)
+    for i in range(n_bins):
+        in_bin = (r_flat >= bins[i]) & (r_flat < bins[i + 1]) & finite_flat
+        if in_bin.sum() >= 3:
+            profile[i] = float(np.median(img_flat[in_bin]))
+
+    # ── Smooth profile ────────────────────────────────────────────────────
+    # 1-D median filter kills single-bin spikes from noise or a bright
+    # neighbour crossing one annulus, without blurring the broad radial
+    # gradient that carries the halo extent information.
+    if smooth_bins > 1 and n_bins >= smooth_bins:
+        profile_s = _median_filter(profile, size=smooth_bins, mode='nearest')
+    else:
+        profile_s = profile.copy()
+
+    # ── Find halo radius ──────────────────────────────────────────────────
+    # Walk outward; keep updating halo_r as long as the profile is above
+    # threshold.  The last update gives the outermost extent of the halo.
+    halo_r = float(min_radius)
+    for i in range(n_bins):
+        if profile_s[i] >= threshold:
+            halo_r = max(float(r_centers[i]), min_radius)
+
+    # ── Build circular mask ───────────────────────────────────────────────
+    mask = R <= halo_r
+    return mask, halo_r
 
 
 def _write_reg_file(path, coordsys, regions, colour):

@@ -114,3 +114,124 @@ def constant_image():
 def all_nan_image():
     """All-NaN image."""
     return np.full((64, 64), np.nan)
+
+
+# ── Synthetic spike-line fixtures ─────────────────────────────────────────────
+#
+# These images contain drawn spike lines (no PSF) and are intended for
+# precise angle-recovery tests.  Morphological opening with a large
+# structuring element would erase thin Gaussian-broadened lines, so tests
+# that use these fixtures call detect() with morph_radius=0.
+
+
+def _make_spike_image(
+    rng,
+    size=256,
+    spike_angles=(30, 120),
+    spike_brightness=100,
+    noise_sigma=2.0,
+    spike_half_len=110,
+    blur_sigma=2.0,
+    saturated_core_half=0,
+    neighbour=None,
+):
+    """Synthetic image with drawn spike lines at known angles.
+
+    Parameters
+    ----------
+    spike_angles : sequence of float
+        Angles in degrees, measured CCW from +col axis (array frame).
+    saturated_core_half : int
+        If > 0, zero out a square of side ``2*saturated_core_half`` at
+        the image centre to simulate a saturated/masked core.
+    neighbour : ((row, col), peak_brightness, sigma) or None
+        Adds a compact Gaussian source.  Using a Gaussian (rather than a
+        flat circle) ensures the neighbour's Radon contribution at ρ ≈ 0
+        is negligible even when the source is near the image edge — a flat
+        filled circle can produce a large chord at ρ ≈ 0 that dominates
+        the sinogram threshold and suppresses real spike detections.
+    blur_sigma : float
+        Gaussian blur applied after drawing; broadens spikes so they
+        survive the sigma-clip preprocessing step.
+    """
+    img = rng.normal(0, noise_sigma, (size, size)).astype(float)
+    cx, cy = size // 2, size // 2
+
+    for angle_deg in spike_angles:
+        rad = np.deg2rad(angle_deg)
+        r1 = int(cy + spike_half_len * np.sin(rad))
+        c1 = int(cx + spike_half_len * np.cos(rad))
+        r2 = int(cy - spike_half_len * np.sin(rad))
+        c2 = int(cx - spike_half_len * np.cos(rad))
+        rr, cc = draw_line(
+            np.clip(r2, 0, size - 1), np.clip(c2, 0, size - 1),
+            np.clip(r1, 0, size - 1), np.clip(c1, 0, size - 1),
+        )
+        img[rr, cc] += spike_brightness
+
+    img = gaussian_filter(img, sigma=blur_sigma)
+
+    if saturated_core_half > 0:
+        n = saturated_core_half
+        img[cy - n:cy + n, cx - n:cx + n] = 0
+
+    if neighbour is not None:
+        (nr, nc), nbr_peak, nbr_sigma = neighbour
+        Y, X = np.ogrid[:size, :size]
+        img += nbr_peak * np.exp(
+            -((X - nc) ** 2 + (Y - nr) ** 2) / (2 * nbr_sigma ** 2)
+        )
+
+    return img
+
+
+@pytest.fixture
+def spike_clean(rng):
+    """256×256 spikes at 30° and 120°, no saturation, no neighbour."""
+    return _make_spike_image(rng, spike_angles=(30, 120))
+
+
+@pytest.fixture
+def spike_saturated_core(rng):
+    """256×256 spikes at 30° and 120° with a zeroed 50-px core."""
+    return _make_spike_image(
+        rng, spike_angles=(30, 120), saturated_core_half=25,
+    )
+
+
+@pytest.fixture
+def spike_nan_core(rng):
+    """256×256 spikes at 30° and 120° with a NaN core."""
+    img = _make_spike_image(rng, spike_angles=(30, 120))
+    cx, cy = 128, 128
+    img[cy - 25:cy + 25, cx - 25:cx + 25] = np.nan
+    return img
+
+
+@pytest.fixture
+def spike_bright_neighbour(rng):
+    """256×256 spikes at 30° and 120° plus a bright Gaussian source near edge.
+
+    The neighbour uses a compact Gaussian (not a flat circle) so that its
+    Radon projection at ρ ≈ 0 (central band) is negligible.
+    """
+    return _make_spike_image(
+        rng,
+        spike_angles=(30, 120),
+        neighbour=((200, 50), 2000, 5),   # (row, col), peak, sigma
+    )
+
+
+@pytest.fixture
+def spike_multi_angle_full(rng):
+    """256×256 spikes at 30°, 120°, 140°, 170° with saturated core + neighbour.
+
+    Mirrors the user's full scenario: close angle pairs, saturated core,
+    and an off-edge bright source that should not create false detections.
+    """
+    return _make_spike_image(
+        rng,
+        spike_angles=(30, 120, 140, 170),
+        saturated_core_half=25,
+        neighbour=((200, 50), 2000, 5),   # (row, col), peak, sigma
+    )
