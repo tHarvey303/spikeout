@@ -202,6 +202,9 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
                         label=f"− arm ({sl.length_neg:.0f} px"
                               + ("" if sl.converged_neg else ", extrap") + ")")
 
+            # Fix ylims to avoid autoscaling to the noise floor in long arms
+            ax.set_ylim(ax.get_ylim()[0], ax.get_ylim()[1])
+
             # Fraunhofer fit + envelope
             if sl.popt is not None:
                 r_all = np.concatenate([sl.radii_pos, sl.radii_neg])

@@ -552,6 +552,13 @@ def measure_spike_lengths(
         bg_level = float(np.median(img[np.isfinite(img)]))
 
     sigma_bg = mad_std(residual[np.isfinite(residual)])
+
+    # measure from annular background rather than local profile to avoid bias from spike wings
+    mask = residual[residual < bg_level + 10 * sigma_bg]  # exclude bright outliers from sigma estimate
+    sigma_bg = mad_std(mask) if mask.size > 0 else sigma_bg
+    print(f'Background level: {bg_level:.4f}, σ_MAD: {sigma_bg:.4f}')
+
+
     threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
 
     if swath_width is None:
