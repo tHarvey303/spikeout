@@ -112,8 +112,41 @@ def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
     return radii[:end], profile[:end]
 
 
-def _find_arm_endpoint(profile, threshold, min_run_pixels):
+def _blank_core_radius(image, centre=None):
+    """Radius of the NaN/zero patch centred on ``centre``.
+
+    A saturated or masked star core is represented as NaN or exactly zero.
+    This function measures how far that patch extends so callers can skip
+    the corrupted inner region of swath profiles.
+
+    Returns 0.0 if the centre pixel is finite and non-zero.
+    """
+    ny, nx = image.shape
+    if centre is None:
+        cy, cx = ny / 2.0, nx / 2.0
+    else:
+        cy, cx = centre
+    cy_i, cx_i = int(round(cy)), int(round(cx))
+    if not (0 <= cy_i < ny and 0 <= cx_i < nx):
+        return 0.0
+    blank = ~np.isfinite(image) | (image == 0.0)
+    if not blank[cy_i, cx_i]:
+        return 0.0
+    Y, X = np.ogrid[:ny, :nx]
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    nearby = blank & (dist <= min(ny, nx) / 4.0)
+    return float(dist[nearby].max()) if nearby.any() else 0.0
+
+
+def _find_arm_endpoint(profile, threshold, min_run_pixels, skip_before=0):
     """Find the first run of ``min_run_pixels`` consecutive below-threshold points.
+
+    Parameters
+    ----------
+    skip_before : int
+        Profile indices ``< skip_before`` are ignored for run counting.
+        Use this to skip the negative/NaN inner region produced by a
+        NaN/zero star core after azimuthal-median subtraction.
 
     Returns
     -------
@@ -125,6 +158,9 @@ def _find_arm_endpoint(profile, threshold, min_run_pixels):
     below = profile < threshold
     run_length = 0
     for j in range(len(below)):
+        if j < skip_before:
+            run_length = 0  # reset — blank-core region cannot terminate the arm
+            continue
         if below[j]:
             run_length += 1
             if run_length >= min_run_pixels:
@@ -135,18 +171,28 @@ def _find_arm_endpoint(profile, threshold, min_run_pixels):
 
 
 def _extrapolate_arm_end(radii, profile, threshold, bg_level=0.0,
-                         min_fit_points=6):
+                         min_fit_radius=0.0, min_fit_points=6):
     """Estimate the arm end by fitting a power-law decay.
 
     Fits ``profile[i] - bg ≈ A · r[i]^α`` (with α < 0) to the tail of the
     profile in log-log space, then solves for the radius where the fit
     crosses *threshold*.
 
+    Parameters
+    ----------
+    min_fit_radius : float
+        Only use profile points with ``radii >= min_fit_radius``.  Set to
+        the blank-core radius to exclude the corrupted inner segment.
+
     Returns the extrapolated radius, or *None* if the fit is unreliable
     (too few points, non-decaying trend, or non-finite result).
     """
     excess_profile = profile - bg_level
-    valid = np.isfinite(excess_profile) & (excess_profile > 0)
+    valid = (
+        np.isfinite(excess_profile)
+        & (excess_profile > 0)
+        & (radii >= min_fit_radius)
+    )
     if valid.sum() < min_fit_points:
         return None
 
@@ -188,13 +234,19 @@ def _measure_arm_adaptive(
     residual, x0, y0, arm_angle, swath_width,
     threshold, min_run_pixels, bg_level,
     initial_radius, max_radius, growth_factor,
+    blank_r=0.0,
 ):
     """Measure one spike arm with adaptive radius expansion.
 
-    Starts the swath profile at ``initial_radius`` and doubles (×
-    ``growth_factor``) until the arm end drops below *threshold*, or
+    Starts the swath profile at ``initial_radius`` and multiplies by
+    ``growth_factor`` until the arm end drops below *threshold*, or
     ``max_radius`` is reached.  At ``max_radius``, a power-law fit to the
     profile tail provides an extrapolated estimate.
+
+    ``blank_r`` is the radius of any NaN/zero core at the star centre.
+    Profile points inside this radius are skipped when searching for the
+    arm endpoint and when fitting the power-law decay, because azimuthal-
+    median subtraction leaves them artificially negative.
 
     Returns
     -------
@@ -213,8 +265,10 @@ def _measure_arm_adaptive(
             max_radius=capped_r,
         )
 
+        # Skip the blank-core segment when searching for the endpoint
+        skip_before = int(np.searchsorted(radii, blank_r))
         endpoint_idx, converged = _find_arm_endpoint(
-            profile, threshold, min_run_pixels,
+            profile, threshold, min_run_pixels, skip_before=skip_before,
         )
 
         if converged:
@@ -222,9 +276,10 @@ def _measure_arm_adaptive(
 
         # Spike still above threshold at the edge — try to grow
         if capped_r >= max_radius:
-            # At hard limit: extrapolate from the profile tail
+            # At hard limit: extrapolate from the profile tail, excluding core
             r_extrap = _extrapolate_arm_end(
                 radii, profile, threshold, bg_level,
+                min_fit_radius=blank_r,
             )
             if r_extrap is not None and r_extrap > radii[-1]:
                 return float(min(r_extrap, max_radius)), radii, profile, False
@@ -292,7 +347,13 @@ def measure_spike_lengths(
     -------
     lengths : list of `SpikeLengths`
     """
-    image = np.asarray(image, dtype=float).copy()
+    image = np.asarray(image, dtype=float)
+
+    # Measure blank-core radius from the original image before filling NaNs,
+    # so the corrupted inner segment of swath profiles can be skipped.
+    blank_r = _blank_core_radius(image, centre=centre)
+
+    image = image.copy()
     image[~np.isfinite(image)] = 0.0
 
     if centre is None:
@@ -314,7 +375,9 @@ def measure_spike_lengths(
 
     img_diag = float(np.hypot(*image.shape))
     if initial_radius is None:
-        initial_radius = min(image.shape) / 4.0
+        # Ensure the first trial window extends well past the blank core so
+        # there is real spike signal to measure from the start.
+        initial_radius = max(min(image.shape) / 4.0, blank_r + swath_width * 2.0)
     if max_radius is None:
         max_radius = img_diag
 
@@ -339,6 +402,7 @@ def measure_spike_lengths(
                 residual, x0, y0, arm_angle, swath_width,
                 threshold, min_run_pixels, bg_level,
                 initial_radius, max_radius, radius_growth_factor,
+                blank_r=blank_r,
             )
             arm_results[label] = (arm_length, radii, profile, converged)
 
