@@ -78,7 +78,7 @@ def prepare_image(
     morph_radius=3,
     sigma_clip=1.5,
     asinh_stretch=None,
-    subtract_median=False,
+    subtract_median=True,
 ):
     """Preprocess an image to isolate diffraction spikes.
 

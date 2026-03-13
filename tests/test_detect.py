@@ -29,9 +29,9 @@ class TestDetectBasic:
             assert 0 <= a < 360
 
     def test_snr_positive(self, star_centred):
-        """Accepted peaks should have positive SNR."""
-        result = detect(star_centred, min_snr=0.0)
-        assert (result.snr >= 0).all()
+        """Peaks accepted by the SNR filter should have SNR >= the threshold."""
+        result = detect(star_centred, min_snr=3.0)
+        assert (result.snr >= 3.0).all()
 
     def test_sinogram_shape(self, star_centred):
         """Sinogram should have (n_rho, n_theta) shape."""
@@ -65,7 +65,7 @@ class TestDetectAngles:
 
     def test_two_spikes_centred(self, star_centred):
         """Should detect two spikes for a centred star with two spikes."""
-        result = detect(star_centred, min_snr=3.0)
+        result = detect(star_centred)
         assert len(result.angles) == 2
 
     def test_four_spikes(self, star_four_spikes):

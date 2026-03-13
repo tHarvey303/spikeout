@@ -260,7 +260,7 @@ def detect(
     # line still passes through the star if extended, but the bright
     # segment stops at the saturation boundary.  We automatically extend
     # the accepted band by R_blank so these spikes are not missed.
-    blank_r = 0#_central_blank_radius(image)
+    blank_r = _central_blank_radius(image)
     max_rho_px = max_rho_fraction * min(image.shape) / 2.0 + blank_r
     all_rho_phys = sinogram_rho_to_physical(np.arange(n_rho), n_rho)
     rho_central = np.abs(all_rho_phys) <= max_rho_px  # shape (n_rho,)
