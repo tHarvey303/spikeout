@@ -327,8 +327,18 @@ def plot_catalogue(
             finite = entry.cutout[np.isfinite(entry.cutout)]
             vmin, vmax = np.percentile(finite, [vmin_pct, vmax_pct]) \
                 if finite.size > 0 else (0, 1)
+            
+            finite = entry.cutout[np.isfinite(entry.cutout)]
+            from matplotlib.colors import Normalize, LogNorm
+            vmin, vmax = np.percentile(finite, [vmin_pct, vmax_pct]) \
+                if finite.size > 0 else (0, 1)
+            
+            vmin = vmax/1e3
             ax.imshow(entry.cutout, origin='lower', cmap='gray',
-                      vmin=vmin, vmax=vmax)
+                      norm=LogNorm(vmin=vmin, vmax=vmax))
+
+            ax.set_xlim(0, entry.cutout.shape[1])
+            ax.set_ylim(0, entry.cutout.shape[0])
 
             res = entry.result
             if res is not None and len(res.angles) > 0:
