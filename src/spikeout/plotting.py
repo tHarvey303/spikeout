@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from .stats import mad_std
 
 from .detect import detect
-from .geometry import radon_line_to_image
+from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .preprocess import azimuthal_median
 
 __all__ = ["plot_diagnostics"]
@@ -45,7 +45,15 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
     pk_rho = result.peak_rho_indices
     pk_th = result.peak_theta_indices
     centre_row = n_rho // 2
-    max_rho_px = max_rho_fraction * min(image.shape) / 2.0
+    # Use the actual acceptance band stored in the result (includes blank_r
+    # for saturated stars) rather than recomputing from max_rho_fraction alone.
+    max_rho_px = result.max_rho_px if result.max_rho_px > 0 \
+        else max_rho_fraction * min(image.shape) / 2.0
+
+    # Reconstruct the ρ-restricted sinogram for the angular profile panel.
+    all_rho_phys = sinogram_rho_to_physical(np.arange(n_rho), n_rho)
+    rho_central = np.abs(all_rho_phys) <= max_rho_px
+    sinogram_central = sinogram * rho_central[:, np.newaxis]
 
     has_lengths = result.lengths is not None and len(result.lengths) > 0
     n_spikes = len(result.angles)
@@ -102,8 +110,10 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
     ax.legend(loc="upper right", fontsize=7)
 
     # panel 3: angular profile with SNR labels
+    # Use sinogram_central (|ρ| ≤ max_rho_px) to match what the detector
+    # actually used — off-centre sources are excluded from this profile.
     ax = axes[0, 2]
-    max_profile = np.max(sinogram, axis=0)
+    max_profile = np.max(sinogram_central, axis=0)
     ax.plot(theta, max_profile, "k-", lw=1)
     if len(pk_th) > 0:
         for j, ti in enumerate(pk_th):
@@ -119,7 +129,7 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
         )
     ax.set(
         xlabel="Projection angle (°)", ylabel="Peak intensity along ρ",
-        title="Angular profile (max over ρ)",
+        title=f"Angular profile (|ρ| ≤ {max_rho_px:.0f} px)",
     )
 
     # panel 4: original image with spike lines

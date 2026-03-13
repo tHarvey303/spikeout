@@ -55,6 +55,7 @@ class SpikeResult:
     prepared_image: np.ndarray
     n_rejected_snr: int = 0
     lengths: Optional[List[SpikeLengths]] = None
+    max_rho_px: float = 0.0
 
     def __repr__(self) -> str:
         n = len(self.angles)
@@ -249,9 +250,12 @@ def detect(
     sinogram_central = sinogram * rho_central[:, np.newaxis]
 
     # ── 2-D peak detection ───────────────────────────────────────────────
+    # All operations are restricted to sinogram_central (|ρ| ≤ max_rho_px)
+    # so that off-centre bright sources never influence threshold, peak
+    # locations, ρ assignment, or SNR estimation.
     abs_threshold = peak_prominence * np.max(sinogram_central)
-    local_max = maximum_filter(sinogram, size=local_max_window)
-    peak_map = (sinogram == local_max) & (sinogram > abs_threshold)
+    local_max = maximum_filter(sinogram_central, size=local_max_window)
+    peak_map = (sinogram_central == local_max) & (sinogram_central > 0)
 
     max_along_rho = np.max(sinogram_central * peak_map, axis=0)
 
@@ -264,10 +268,12 @@ def detect(
         distance=min_sep_idx,
     )
 
-    # Use the full sinogram to find the true brightest ρ at each detected
-    # angle — for a saturated star this is at the edge of the blank core.
+    # Find the brightest ρ within the central band for each detected angle.
+    # Using sinogram_central (zeroed outside the band) ensures off-centre
+    # sources never hijack the ρ assignment and cause valid spikes to fail
+    # the subsequent central_mask check.
     peak_rho_idx = np.array(
-        [np.argmax(sinogram[:, ti]) for ti in peaks_1d],
+        [np.argmax(sinogram_central[:, ti]) for ti in peaks_1d],
     )
     rho_phys = sinogram_rho_to_physical(peak_rho_idx, n_rho).astype(float)
 
@@ -284,7 +290,7 @@ def detect(
 
     # ── filter: significance (SNR) ────────────────────────────────────────
     if len(peaks_1d) > 0 and min_snr > 0:
-        snr_values = _angular_profile_snr(sinogram, peaks_1d)
+        snr_values = _angular_profile_snr(sinogram_central, peaks_1d)
         snr_mask = snr_values >= min_snr
         n_rejected_snr = int(np.sum(~snr_mask))
 
@@ -293,7 +299,7 @@ def detect(
         rho_phys = rho_phys[snr_mask]
         snr_values = snr_values[snr_mask]
     else:
-        snr_values = _angular_profile_snr(sinogram, peaks_1d) \
+        snr_values = _angular_profile_snr(sinogram_central, peaks_1d) \
             if len(peaks_1d) > 0 else np.array([])
         n_rejected_snr = 0
 
@@ -318,6 +324,7 @@ def detect(
         peak_theta_indices=peaks_1d,
         prepared_image=prepared,
         n_rejected_snr=n_rejected_snr,
+        max_rho_px=max_rho_px,
     )
 
     # ── optional length measurement ──────────────────────────────────────

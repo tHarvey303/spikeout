@@ -156,7 +156,16 @@ def prepare_image(
         return residual
 
     if asinh_stretch is None:
-        asinh_stretch = np.median(pos)
+        # Compute the scale from the inner ~50% of the image radius so that
+        # bright off-centre sources do not compress the central spike signal.
+        ny, nx = residual.shape
+        cy, cx = ny / 2.0, nx / 2.0
+        Y, X = np.ogrid[:ny, :nx]
+        inner_r = min(ny, nx) / 4.0  # 50 % of the half-size
+        inner_mask = ((X - cx) ** 2 + (Y - cy) ** 2) <= inner_r ** 2
+        inner_pos = residual[inner_mask & (residual > 0)]
+        asinh_stretch = np.median(inner_pos) if inner_pos.size > 0 \
+            else np.median(pos)
     if asinh_stretch <= 0:
         asinh_stretch = 1.0
 
