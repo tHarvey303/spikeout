@@ -52,6 +52,7 @@ class SpikeLengths:
     popt: Optional[np.ndarray] = None
     threshold: float = 0.0
     background_profile: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    swath_width: float = 0.0
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -741,6 +742,7 @@ def measure_spike_lengths(
             popt=popt,
             threshold=threshold,
             background_profile=(r_bg_sorted, p_bg_smooth) if background_profiles else None,
+            swath_width=swath_width,
         ))
 
     return lengths

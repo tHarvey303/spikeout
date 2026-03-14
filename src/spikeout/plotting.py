@@ -12,7 +12,7 @@ from .lengths import _fraunhofer_model, _envelope_model
 __all__ = ["plot_diagnostics"]
 
 
-def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
+def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False, **detect_kw):
     """Multi-panel diagnostic figure.
 
     Layout
@@ -27,6 +27,9 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
         If *None*, detection is run with *detect_kw*.
     max_rho_fraction : float
         Passed through if detection is run.
+    show_swath : bool
+        If *True* and lengths were measured, overlay the swath extraction
+        regions on the image panel as semi-transparent rectangles.
     **detect_kw
         Forwarded to `~spikeout.detect.detect`.
 
@@ -171,6 +174,41 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
                 ex = x0 + sign * arm_len * np.cos(a_rad)
                 ey = y0 + sign * arm_len * np.sin(a_rad)
                 ax.plot(ex, ey, "o", color=color, ms=6, mew=1.5, mfc="none")
+
+            if show_swath and sl.swath_width > 0:
+                from matplotlib.patches import Polygon as MplPolygon
+                # Perpendicular unit vector (rotated 90° from along direction)
+                px = -np.sin(a_rad)
+                py = np.cos(a_rad)
+                half_w = sl.swath_width / 2.0
+                # Rectangle corners: from start of pos arm to end, and neg arm
+                r_start_pos = float(sl.radii_pos[0]) if len(sl.radii_pos) else 0.0
+                r_start_neg = float(sl.radii_neg[0]) if len(sl.radii_neg) else 0.0
+                far_pos_x = x0 + sl.length_pos * np.cos(a_rad)
+                far_pos_y = y0 + sl.length_pos * np.sin(a_rad)
+                far_neg_x = x0 - sl.length_neg * np.cos(a_rad)
+                far_neg_y = y0 - sl.length_neg * np.sin(a_rad)
+                near_pos_x = x0 + r_start_pos * np.cos(a_rad)
+                near_pos_y = y0 + r_start_pos * np.sin(a_rad)
+                near_neg_x = x0 - r_start_neg * np.cos(a_rad)
+                near_neg_y = y0 - r_start_neg * np.sin(a_rad)
+                # Draw each arm's swath as a separate semi-transparent rectangle
+                for (x_near, y_near), (x_far, y_far) in [
+                    ((near_pos_x, near_pos_y), (far_pos_x, far_pos_y)),
+                    ((near_neg_x, near_neg_y), (far_neg_x, far_neg_y)),
+                ]:
+                    corners = np.array([
+                        [x_near + half_w * px, y_near + half_w * py],
+                        [x_near - half_w * px, y_near - half_w * py],
+                        [x_far  - half_w * px, y_far  - half_w * py],
+                        [x_far  + half_w * px, y_far  + half_w * py],
+                    ])
+                    patch = MplPolygon(
+                        corners, closed=True,
+                        facecolor=color, edgecolor=color,
+                        alpha=0.15, lw=0.8, zorder=3,
+                    )
+                    ax.add_patch(patch)
 
     ax.set(
         xlim=(0, image.shape[1]), ylim=(0, image.shape[0]),
