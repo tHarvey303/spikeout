@@ -435,32 +435,46 @@ def _fit_spike_profile(
         return None, p_pos_s, p_neg_s
 
 
-def _find_envelope_crossing(popt, threshold, r_max):
+def _find_envelope_crossing(popt, threshold, r_start):
     """Find the radius where the Fraunhofer envelope crosses *threshold*.
 
-    Uses Brent's method on a bracketed interval.
+    Searches from *r_start* outward (for unconverged arms the profile ends
+    at *r_start*, so the crossing must be extrapolated beyond it).  Falls
+    back to a search inside ``[1 px, r_start]`` if the envelope is already
+    below threshold there.
 
     Returns the crossing radius, or *None* if the envelope never drops
-    below *threshold* within ``[1 px, r_max]``.
+    below *threshold* (e.g. ``threshold <= d``).
     """
     a, b, c, alpha, d = popt
     if threshold <= d:
-        return None
+        return None  # envelope asymptotes to d, never drops below threshold
 
     def f(r):
         return _envelope_model(r, a, b, c, alpha, d) - threshold
 
-    r_lo = max(1.0, 1.0 / (np.pi * b))  # near the first sinc² peak
-    if f(r_lo) <= 0:
-        return float(r_lo)
-    if f(r_max) > 0:
-        return float(r_max)  # still above threshold at image edge
+    # Case 1: envelope already below threshold at r_start — find crossing inside
+    if f(r_start) <= 0:
+        r_lo = max(1.0, 1.0 / (np.pi * b))
+        if f(r_lo) <= 0:
+            return float(r_lo)
+        try:
+            res = root_scalar(f, bracket=[r_lo, r_start], method='brentq')
+            return float(res.root) if res.converged else None
+        except ValueError:
+            return None
 
-    try:
-        res = root_scalar(f, bracket=[r_lo, r_max], method='brentq')
-        return float(res.root) if res.converged else None
-    except ValueError:
-        return None
+    # Case 2: envelope still above threshold at r_start — extrapolate outward
+    r_search = r_start
+    for _ in range(20):
+        r_search *= 2.0
+        if f(r_search) <= 0:
+            try:
+                res = root_scalar(f, bracket=[r_start, r_search], method='brentq')
+                return float(res.root) if res.converged else None
+            except ValueError:
+                return None
+    return None  # envelope never drops below threshold
 
 
 def _find_profile_crossing(
