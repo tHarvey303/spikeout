@@ -130,7 +130,7 @@ def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
         iy = np.round(py).astype(int)
         valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
 
-        if valid.sum() < 2:
+        if valid.sum() < max(2, n_perp // 2):
             break
 
         vals = image[iy[valid], ix[valid]]
@@ -529,7 +529,9 @@ def measure_spike_lengths(
         Width (pixels) of the perpendicular sampling band.  Default:
         ``max(3, min(image.shape) * 0.02)``.
     length_sigma : float
-        Arm endpoint threshold: ``background + length_sigma × σ_MAD``.
+        Arm endpoint threshold: ``background + length_sigma × σ_sky``,
+        where ``σ_sky`` is the per-pixel sky noise estimated from
+        pixel-to-pixel differences in the outer image annulus.
     centre : (row, col) or *None*
         Star centre.  Auto-detected if *None*.
     radial_bin_width : int
@@ -576,11 +578,8 @@ def measure_spike_lengths(
         bg_level = 0.0
     else:
         residual = image
-        # Sky background from image median — robust because most pixels are sky.
-        bg_level = float(np.median(img[np.isfinite(img)]))
-
-    sigma_bg = mad_std(residual[np.isfinite(residual)])
-    threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
+        # Background level: median of outer image annulus (far from star).
+        bg_level = None  # computed below after cy/cx are set
 
     if swath_width is None:
         swath_width = max(3.0, min(image.shape) * 0.02)
@@ -590,6 +589,35 @@ def measure_spike_lengths(
 
     if max_radius is None:
         max_radius = float(np.hypot(ny, nx))
+
+    # ── Background noise via pixel-to-pixel differences ───────────────────
+    # Differencing adjacent pixels cancels the smooth PSF halo gradient,
+    # leaving only sky noise.  This gives the true per-pixel sigma even for
+    # very bright stars where mad_std on the raw image is inflated by the
+    # halo signal by 10× or more.
+    Y_g, X_g = np.ogrid[:ny, :nx]
+    R_from_centre = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
+    r_noise_annulus = 0.75 * min(ny, nx) / 2.0
+
+    dx_diff = np.diff(img, axis=1)
+    dy_diff = np.diff(img, axis=0)
+    noise_dx = dx_diff[R_from_centre[:, :-1] > r_noise_annulus]
+    noise_dy = dy_diff[R_from_centre[:-1, :] > r_noise_annulus]
+    noise_all = np.concatenate([noise_dx, noise_dy])
+    noise_all = noise_all[np.isfinite(noise_all)]
+
+    if noise_all.size >= 20:
+        sigma_bg = float(mad_std(noise_all)) / np.sqrt(2)
+    else:
+        sigma_bg = float(mad_std(img[np.isfinite(img)]))
+
+    if bg_level is None:
+        outer_px = img[R_from_centre > r_noise_annulus]
+        outer_px = outer_px[np.isfinite(outer_px)]
+        bg_level = float(np.median(outer_px)) if outer_px.size >= 10 \
+            else float(np.median(img[np.isfinite(img)]))
+
+    threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
 
     theta = result.theta
     pk_th = result.peak_theta_indices
