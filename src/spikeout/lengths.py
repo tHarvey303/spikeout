@@ -173,27 +173,55 @@ def _envelope_model(r, a, b, c, alpha, d):
 
 
 def _estimate_p0(r, p):
-    """Estimate initial Fraunhofer model parameters from profile data."""
-    d0 = max(float(np.percentile(p, 5)), 1e-10)
-    a0 = max(float(np.percentile(p, 95)) - d0, d0)
+    """Estimate initial Fraunhofer model parameters from profile data.
 
-    # b0: sinc²(b·r) = 0.5 near b·r ≈ 0.6 → b ≈ 0.6 / r_half
-    p_above = p - d0
-    half_level = 0.5 * p_above.max()
-    candidates = r[p_above >= half_level]
-    r_half = float(candidates[-1]) if len(candidates) else float(r[len(r) // 4])
-    b0 = float(np.clip(0.6 / max(r_half, 1.0), 1e-5, 0.05))
+    Strategy
+    --------
+    1. ``d0`` — lower percentile of the outer tail, where the spike has
+       faded to sky/halo level.  The full-profile P5 is in the signal region
+       and gives a grossly inflated estimate.
+    2. ``(c0, alpha0)`` — log-log fit on the raw outer half of the profile,
+       *without* subtracting ``d0``.  Subtracting a noisy ``d0`` from
+       already-small tail values produces near-zero residuals, causing the
+       power-law slope to diverge and ``alpha`` to hit its bound.  sinc²
+       contributes little in the outer half, so the raw slope ≈ ``−alpha``.
+    3. ``a0`` — peak of the halo-subtracted inner profile.
+    4. ``b0`` — half-power radius of the halo-subtracted spike component.
+       ``sinc²(b·r) = 0.5`` at ``b·r ≈ 0.45``.
+    """
+    # 1. Background
+    n_outer = max(5, len(p) // 4)
+    d0 = max(float(np.percentile(p[-n_outer:], 10)), 1e-10)
 
-    # c0, alpha0: power-law fit to the last 20 % of points
-    n_tail = max(3, len(r) // 5)
-    r_tail = r[-n_tail:]
-    p_tail = np.maximum(p[-n_tail:] - d0, 1e-10)
+    # 2. Halo: log-log fit on raw outer half (no d0 subtraction)
+    n_halo = max(5, len(p) // 2)
+    r_halo = r[-n_halo:]
+    p_halo = np.maximum(p[-n_halo:], 1e-30)
     try:
-        slope, intercept = np.polyfit(np.log(r_tail), np.log(p_tail), 1)
-        alpha0 = float(np.clip(-slope, 0.1, 3.0))
+        slope, intercept = np.polyfit(np.log(r_halo), np.log(p_halo), 1)
+        alpha0 = float(np.clip(-slope, 0.5, 3.0))
         c0 = max(float(np.exp(intercept)), d0)
     except Exception:
-        alpha0, c0 = 1.0, a0 * float(r[0])
+        alpha0 = 1.5
+        c0 = max(float(np.median(p)) * float(r[len(r) // 2]) ** 1.5, d0)
+
+    # 3. Spike amplitude: peak of inner profile minus estimated halo
+    n_inner = max(3, len(p) // 3)
+    r_safe = np.maximum(r[:n_inner], 0.5)
+    halo_inner = c0 / r_safe ** alpha0 + d0
+    a0 = max(float(np.max(np.maximum(p[:n_inner] - halo_inner, 0))), d0)
+
+    # 4. Sinc² frequency: half-power of halo-subtracted spike
+    r_safe_full = np.maximum(r, 0.5)
+    halo_full = c0 / r_safe_full ** alpha0 + d0
+    p_spike = np.maximum(p - halo_full, 0)
+    half_target = 0.5 * p_spike.max()
+    if half_target > 0:
+        candidates = r[p_spike >= half_target]
+        r_half = float(candidates[-1]) if len(candidates) else float(r[-1])
+    else:
+        r_half = float(r[-1])
+    b0 = float(np.clip(0.45 / max(r_half, 1.0), 1e-5, 0.05))
 
     return [a0, b0, c0, alpha0, d0]
 
