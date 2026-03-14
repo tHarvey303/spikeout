@@ -202,6 +202,15 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, **detect_kw):
                         label=f"− arm ({sl.length_neg:.0f} px"
                               + ("" if sl.converged_neg else ", extrap") + ")")
 
+            # Fix ylims to avoid autoscaling to the noise floor in long arms
+            low = 0.1*sl.threshold if sl.threshold > 0 else 1e-4
+            ax.set_ylim(low, ax.get_ylim()[1])
+
+            if result.lengths[i].background_profile is not None:
+                r_bg, p_bg = result.lengths[i].background_profile
+                ax.semilogy(r_bg, np.maximum(p_bg, 1e-30), ":", color="green",
+                            lw=1.0, alpha=0.7, label="Background profile")
+
             # Fraunhofer fit + envelope
             if sl.popt is not None:
                 r_all = np.concatenate([sl.radii_pos, sl.radii_neg])
