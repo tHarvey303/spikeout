@@ -36,6 +36,8 @@ class SpikeLengths:
         Fitted Fraunhofer parameters ``(a, b, c, alpha, d)``.
     threshold : float
         Detection threshold used for arm endpoint measurement.
+    background_profile : tuple of (r_bg, p_bg)
+        (radii, profile) of the median background profile extracted from random angles, for sanity check and potential future use.
     """
     angle_deg: float
     length_pos: float
@@ -49,7 +51,7 @@ class SpikeLengths:
     converged_neg: bool = True
     popt: Optional[np.ndarray] = None
     threshold: float = 0.0
-
+    background_profile: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -76,7 +78,7 @@ def _blank_core_radius(image, centre=None):
     return float(dist[nearby].max()) if nearby.any() else 0.0
 
 
-def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
+def _extract_swath_profile(image, x0, y0, angle_deg, swath_width, combine_function=np.nansum,
                            step=1.0, max_radius=None):
     """Extract a median swath profile along a direction from a point.
 
@@ -92,6 +94,9 @@ def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
         Direction to walk (degrees CCW from +x in display frame).
     swath_width : float
         Full width (pixels) of the perpendicular band.
+    combine_function : callable
+        Function to combine the perpendicular samples at each radius.  Default
+        is `numpy.nansum`.
     step : float
         Radial step size (pixels).
     max_radius : float or *None*
@@ -136,7 +141,7 @@ def _extract_swath_profile(image, x0, y0, angle_deg, swath_width,
         vals = image[iy[valid], ix[valid]]
         finite_vals = vals[np.isfinite(vals)]
         if finite_vals.size > 0:
-            profile[i] = np.median(finite_vals)
+            profile[i] = combine_function(finite_vals)
 
     last_valid = np.where(np.isfinite(profile))[0]
     if len(last_valid) == 0:
@@ -194,6 +199,8 @@ def _estimate_p0(r, p):
         c0 = max(float(np.exp(intercept)), d0)
     except Exception:
         alpha0, c0 = 1.0, a0 * float(r[0])
+
+    print(f"Initial parameter estimates: a={a0:.2e}, b={b0:.2e}, c={c0:.2e}, alpha={alpha0:.2f}, d={d0:.2e}")
 
     return [a0, b0, c0, alpha0, d0]
 
@@ -264,7 +271,7 @@ def _fit_shared_halo(
         alpha0 = float(np.clip(-slope, 0.1, 3.0))
         c0 = max(float(np.exp(intercept)), d0)
     except Exception:
-        alpha0, c0 = 1.5, float(np.median(p_comb))
+        alpha0, c0 = 1.5, float(np.nanmedian(p_comb))
 
     def _log_halo(r, c, alpha, d):
         return np.log10(np.maximum(c / r ** alpha + d, 1e-30))
@@ -349,7 +356,7 @@ def _fit_spike_profile(
         return None, p_pos_s, p_neg_s
 
     # ── constrained fit: (a, b) only, halo fixed ──────────────────────────
-    if shared_halo is not None:
+    if shared_halo is not None and False:
         c_s, alpha_s, d_s = shared_halo
 
         def _log_model_ab(r, a, b):
@@ -368,16 +375,21 @@ def _fit_spike_profile(
             (a_fit, b_fit), _ = curve_fit(
                 _log_model_ab, r_comb, np.log10(p_comb),
                 p0=[a0, b0],
-                bounds=([0.0, 1e-5], [np.inf, 0.1]),
+                #bounds=([0.0, 1e-5], [np.inf, 0.1]),
                 maxfev=5000,
             )
+            print(a_fit, b_fit, c_s, alpha_s, d_s)
             return np.array([a_fit, b_fit, c_s, alpha_s, d_s]), p_pos_s, p_neg_s
         except (RuntimeError, ValueError, TypeError):
             pass  # fall through to unconstrained fit
 
     # ── unconstrained fit: all 5 parameters ───────────────────────────────
     p0 = _estimate_p0(r_comb, p_comb)
-    bounds = ([0, 1e-5, 0, 0.1, 0], [np.inf, 0.1, np.inf, 3.0, np.inf])
+    bounds = None #([0, 1e-5, 0, 0.1, 0], [np.inf, 0.1, np.inf, 3.0, np.inf])
+    
+    p0 = np.array([8.78245565e-01, 4.15452670e-03, 2.67775665e+04, 2.34681226e+00,
+       1.42098557e-15])
+    print("Using fixed initial parameters:", p0)
 
     try:
         popt, _ = curve_fit(
@@ -385,11 +397,12 @@ def _fit_spike_profile(
             r_comb,
             np.log10(p_comb),
             p0=p0,
-            bounds=bounds,
+            #bounds=bounds,
             maxfev=10000,
         )
         return popt, p_pos_s, p_neg_s
-    except (RuntimeError, ValueError, TypeError):
+    except (RuntimeError, ValueError, TypeError) as e:
+        print(e)
         return None, p_pos_s, p_neg_s
 
 
@@ -467,6 +480,7 @@ def measure_spike_lengths(
     r_max_fraction=0.7,
     max_radius=None,
     median_subtract=False,
+    background_profiles=True,
 ):
     """Measure the length of each detected spike arm.
 
@@ -523,6 +537,8 @@ def measure_spike_lengths(
         If *True*, subtract the azimuthal median from the image before
         measuring lengths.  This can help isolate the spike profile from the
         PSF halo, but may not be desirable if the halo is very asymmetric.
+    background_profiles : bool
+        If *True*, extract background profiles from random angles for sanity check and potential future use.
 
     Returns
     -------
@@ -531,7 +547,7 @@ def measure_spike_lengths(
     image = np.asarray(image, dtype=float)
 
     # Blank-core radius — needed to skip corrupted inner profile segment
-    blank_r = _blank_core_radius(image, centre=centre)
+    blank_r = _blank_core_radius(image, centre=centre) + 3.0  # add small margin to ensure all blank pixels are excluded
 
     # Working copy with NaNs filled so swath sampling always has data
     img = image.copy()
@@ -590,7 +606,29 @@ def measure_spike_lengths(
             max_radius=max_radius,
         )
         arm_profiles.append((r_pos, p_pos, r_neg, p_neg, x0, y0, angle))
+    
+    if background_profiles:
+        background_profiles = []
+        random_angles = np.random.uniform(0, 360, size=40)
+        # Pick 6 angles with are > 10 degrees away from any spike arm, and extract background profiles there for sanity check and potential future use.
+        for bg_angle in random_angles:
+            if np.all(np.abs((bg_angle - result.angles + 180) % 360 - 180) > 10):
+                r_bg, p_bg = _extract_swath_profile(
+                    img, cx, cy, bg_angle, swath_width, max_radius=max_radius,
+                )
+                background_profiles.append((r_bg, p_bg, bg_angle))
+            if len(background_profiles) >= 6:
+                break
 
+    # compute median background profile for sanity check
+    if background_profiles:
+        r_bg_comb = np.concatenate([r for r, p, a in background_profiles])
+        p_bg_comb = np.concatenate([p for r, p, a in background_profiles])
+        r_bg_sorted = np.sort(r_bg_comb)
+        p_bg_sorted = p_bg_comb[np.argsort(r_bg_comb)]
+        sz = max(1, int(smooth_size))
+        p_bg_smooth = median_filter(p_bg_sorted, size=sz, mode='nearest') if sz > 1 else p_bg_sorted.copy()
+        
     # ── Shared halo fit: (c, alpha, d) from all arms jointly ─────────────
     # The PSF halo is azimuthally symmetric, so these parameters are the
     # same for every spike arm.  Fitting from all arms gives far more data
@@ -653,6 +691,7 @@ def measure_spike_lengths(
             converged_neg=arm_results["neg"][3],
             popt=popt,
             threshold=threshold,
+            background_profile=(r_bg_sorted, p_bg_smooth) if background_profiles else None,
         ))
 
     return lengths
