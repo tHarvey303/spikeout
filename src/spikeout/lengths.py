@@ -235,7 +235,7 @@ def _estimate_p0(r, p):
 
 
 def _fit_shared_halo(
-    arm_data_list,
+    arm_pairs_list,
     blank_r: float = 0.0,
     smooth_size: int = 10,
     r_min: Optional[float] = None,
@@ -253,10 +253,16 @@ def _fit_shared_halo(
     arm's profile, where the sinc² oscillations have largely decayed and the
     signal is halo-dominated.
 
+    For each spike pair the two arms are interpolated onto a shared radius
+    grid and the element-wise minimum is taken before contributing to the
+    joint fit.  This suppresses contamination from neighbouring sources: a
+    neighbour inflating one arm at a given radius is discarded in favour of
+    the lower, uncontaminated arm.
+
     Parameters
     ----------
-    arm_data_list : list of (r, p) tuples
-        All arm profiles to use (typically both arms of every spike).
+    arm_pairs_list : list of (r_pos, p_pos, r_neg, p_neg) tuples
+        Both arms for each detected spike.
     blank_r, smooth_size, r_min, r_max_fraction
         Same meaning as in `_fit_spike_profile`.
     halo_region_start : float
@@ -272,17 +278,41 @@ def _fit_shared_halo(
     fit_r_min = max(blank_r, r_min if r_min is not None else 1.0)
 
     r_all, p_all = [], []
-    for r, p in arm_data_list:
-        if len(r) < 4:
-            continue
-        p_s = median_filter(p, size=sz, mode='nearest') if sz > 1 else p.copy()
-        r_max_arm = float(r[-1])
-        r_lo = max(fit_r_min, halo_region_start * r_max_arm)
-        r_hi = r_max_fraction * r_max_arm
-        mask = (r > r_lo) & (r <= r_hi) & (p_s > 0)
-        if mask.sum() >= 3:
-            r_all.append(r[mask])
-            p_all.append(p_s[mask])
+    for r_pos, p_pos, r_neg, p_neg in arm_pairs_list:
+        p_pos_s = median_filter(p_pos, size=sz, mode='nearest') if sz > 1 else p_pos.copy()
+        p_neg_s = median_filter(p_neg, size=sz, mode='nearest') if sz > 1 else p_neg.copy()
+
+        # For each arm, attempt to form a minimum-envelope with the opposite arm
+        # over the halo window, falling back to the arm alone when the other is
+        # too short to cover the relevant radius range.
+        for r_arm, p_arm_s, r_other, p_other_s in [
+            (r_pos, p_pos_s, r_neg, p_neg_s),
+            (r_neg, p_neg_s, r_pos, p_pos_s),
+        ]:
+            if len(r_arm) < 4:
+                continue
+            r_max_arm = float(r_arm[-1])
+            r_lo = max(fit_r_min, halo_region_start * r_max_arm)
+            r_hi = r_max_fraction * r_max_arm
+            if r_lo >= r_hi:
+                continue
+            r_grid = np.arange(r_lo, r_hi, 1.0)
+            if len(r_grid) < 3:
+                continue
+            p_arm_interp = np.interp(r_grid, r_arm, p_arm_s)
+            if len(r_other) >= 4 and float(r_other[-1]) >= r_lo:
+                p_other_interp = np.interp(r_grid, r_other, p_other_s,
+                                           left=np.nan, right=np.nan)
+                both_valid = np.isfinite(p_other_interp) & (p_arm_interp > 0) & (p_other_interp > 0)
+                if both_valid.sum() >= 3:
+                    r_all.append(r_grid[both_valid])
+                    p_all.append(np.minimum(p_arm_interp[both_valid], p_other_interp[both_valid]))
+                    continue
+            # Fallback: use this arm alone
+            mask = p_arm_interp > 0
+            if mask.sum() >= 3:
+                r_all.append(r_grid[mask])
+                p_all.append(p_arm_interp[mask])
 
     if not r_all:
         return None
@@ -324,6 +354,7 @@ def _fit_spike_profile(
     p_neg: np.ndarray,
     blank_r: float = 0.0,
     smooth_size: int = 10,
+    smooth_size_cross: Optional[int] = None,
     r_min: Optional[float] = None,
     r_max_fraction: float = 0.7,
     shared_halo: Optional[Tuple[float, float, float]] = None,
@@ -336,6 +367,11 @@ def _fit_spike_profile(
     constrained fit for short profiles and when multiple spikes are present.
     Falls back to the full 5-parameter fit if the constrained fit fails.
 
+    The two arms are interpolated onto a shared 1-px radius grid and the
+    element-wise minimum is used as the fitting profile.  This suppresses
+    contamination from neighbouring sources.  Falls back to concatenation if
+    the arms do not share enough radial overlap.
+
     Parameters
     ----------
     r_pos, p_pos : ndarray
@@ -345,7 +381,14 @@ def _fit_spike_profile(
     blank_r : float
         Radius of any NaN/zero core to exclude from fitting.
     smooth_size : int
-        Median-filter window applied before fitting.
+        Median-filter window used for the fitting data (lighter: half of
+        ``smooth_size_cross``).  The sinc² fringe spacing (~1/b ≈ 200–1000 px)
+        greatly exceeds this window, so no fringe information is lost.
+    smooth_size_cross : int or *None*
+        Median-filter window applied to the profiles returned for endpoint
+        detection.  Defaults to ``2 * smooth_size``.  A larger window
+        suppresses noise spikes in the faint outer tail, preventing false
+        early termination of the threshold crossing.
     r_min : float or *None*
         Minimum radius included in the fit.  Defaults to ``blank_r``.
     r_max_fraction : float
@@ -359,27 +402,51 @@ def _fit_spike_profile(
     popt : ndarray or *None*
         Fitted parameters ``(a, b, c, alpha, d)``, or *None* on failure.
     p_pos_smooth, p_neg_smooth : ndarray
-        Smoothed profiles (returned regardless of fit success).
+        Profiles smoothed with ``smooth_size_cross`` for endpoint detection.
     """
-    sz = max(1, int(smooth_size))
-    p_pos_s = median_filter(p_pos, size=sz, mode='nearest') if sz > 1 else p_pos.copy()
-    p_neg_s = median_filter(p_neg, size=sz, mode='nearest') if sz > 1 else p_neg.copy()
+    sz_cross = max(1, int(smooth_size_cross if smooth_size_cross is not None
+                          else smooth_size * 2))
+    sz_fit = max(1, max(3, int(smooth_size) // 2))
+
+    # Lightly smoothed profiles used only for building the fitting data.
+    p_pos_fit = median_filter(p_pos, size=sz_fit, mode='nearest') if sz_fit > 1 else p_pos.copy()
+    p_neg_fit = median_filter(p_neg, size=sz_fit, mode='nearest') if sz_fit > 1 else p_neg.copy()
+
+    # More heavily smoothed profiles returned for threshold crossing.
+    p_pos_s = median_filter(p_pos, size=sz_cross, mode='nearest') if sz_cross > 1 else p_pos.copy()
+    p_neg_s = median_filter(p_neg, size=sz_cross, mode='nearest') if sz_cross > 1 else p_neg.copy()
 
     fit_r_min = max(blank_r, r_min if r_min is not None else 1.0)
 
-    mask_pos = (
-        (r_pos > fit_r_min)
-        & (r_pos < r_max_fraction * float(r_pos[-1]))
-        & (p_pos_s > 0)
-    )
-    mask_neg = (
-        (r_neg > fit_r_min)
-        & (r_neg < r_max_fraction * float(r_neg[-1]))
-        & (p_neg_s > 0)
-    )
+    # Build minimum-envelope on a shared radius grid.  At each radius the
+    # lower of the two (lightly smoothed) arm values is used; a neighbour
+    # source inflating one arm is discarded in favour of the other.
+    r_hi_grid = min(float(r_pos[-1]), float(r_neg[-1])) * r_max_fraction
+    r_comb, p_comb = np.array([]), np.array([])
+    if fit_r_min < r_hi_grid:
+        r_grid = np.arange(fit_r_min, r_hi_grid, 1.0)
+        if len(r_grid) >= 6:
+            p_pos_interp = np.interp(r_grid, r_pos, p_pos_fit)
+            p_neg_interp = np.interp(r_grid, r_neg, p_neg_fit)
+            p_min = np.minimum(p_pos_interp, p_neg_interp)
+            valid = p_min > 0
+            r_comb = r_grid[valid]
+            p_comb = p_min[valid]
 
-    r_comb = np.concatenate([r_pos[mask_pos], r_neg[mask_neg]])
-    p_comb = np.concatenate([p_pos_s[mask_pos], p_neg_s[mask_neg]])
+    # Fallback: concatenate individually masked arm data.
+    if len(r_comb) < 6:
+        mask_pos = (
+            (r_pos > fit_r_min)
+            & (r_pos < r_max_fraction * float(r_pos[-1]))
+            & (p_pos_fit > 0)
+        )
+        mask_neg = (
+            (r_neg > fit_r_min)
+            & (r_neg < r_max_fraction * float(r_neg[-1]))
+            & (p_neg_fit > 0)
+        )
+        r_comb = np.concatenate([r_pos[mask_pos], r_neg[mask_neg]])
+        p_comb = np.concatenate([p_pos_fit[mask_pos], p_neg_fit[mask_neg]])
 
     if len(r_comb) < 6:
         return None, p_pos_s, p_neg_s
@@ -519,6 +586,7 @@ def measure_spike_lengths(
     centre=None,
     radial_bin_width=2,
     smooth_size=10,
+    smooth_size_cross=None,
     r_min=None,
     r_max_fraction=0.7,
     max_radius=None,
@@ -566,8 +634,12 @@ def measure_spike_lengths(
     radial_bin_width : int
         Annular bin width for background estimation.
     smooth_size : int
-        Median-filter window applied to each arm profile before fitting
-        and threshold crossing.  Default 10.
+        Median-filter window for the fitting data (half this value is used
+        internally as ``sz_fit``).  Default 10.
+    smooth_size_cross : int or *None*
+        Median-filter window applied to each arm profile for threshold
+        crossing / endpoint detection.  Defaults to ``2 * smooth_size``.
+        A larger window suppresses noise spikes in the faint outer tail.
     r_min : float or *None*
         Minimum radius included in the log-space fit.  Defaults to the
         blank-core radius (so saturated/NaN cores are excluded).
@@ -697,13 +769,13 @@ def measure_spike_lengths(
     # The PSF halo is azimuthally symmetric, so these parameters are the
     # same for every spike arm.  Fitting from all arms gives far more data
     # than any single arm and makes the 5-parameter per-spike fit tractable.
-    all_arm_data = [
-        (r, p)
+    # Pairs are passed so the halo fitter can form minimum-envelope profiles.
+    arm_pairs = [
+        (r_pos, p_pos, r_neg, p_neg)
         for (r_pos, p_pos, r_neg, p_neg, *_) in arm_profiles
-        for r, p in [(r_pos, p_pos), (r_neg, p_neg)]
     ]
     shared_halo = _fit_shared_halo(
-        all_arm_data,
+        arm_pairs,
         blank_r=blank_r,
         smooth_size=smooth_size,
         r_min=r_min,
@@ -718,6 +790,7 @@ def measure_spike_lengths(
             r_pos, p_pos, r_neg, p_neg,
             blank_r=blank_r,
             smooth_size=smooth_size,
+            smooth_size_cross=smooth_size_cross,
             r_min=r_min,
             r_max_fraction=r_max_fraction,
             shared_halo=shared_halo,
