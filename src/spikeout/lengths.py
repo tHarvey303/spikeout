@@ -193,55 +193,97 @@ def _log_sinc2_model(r, a, b):
     return np.log10(np.maximum(val, 1e-30))
 
 
-def _powerlaw_osc_model(r, A, gamma, f, C, phi):
-    """Power-law envelope modulated by a sinusoidal oscillation.
+def _powerlaw_osc_model(r, A, gamma, f, C, r_dec, phi):
+    """Power-law envelope with sinusoidal oscillation of decaying contrast.
 
-    ``(A / r^gamma) · (1 - C · cos(2π·f·r + φ))``
+    ``(A / r^gamma) · (1 - C · exp(-r/r_dec) · cos(2π·f·r + φ))``
 
-    This is the physically correct model for the background-subtracted
-    diffraction spike radial profile:
-    - ``A / r^gamma`` is the power-law envelope (for a monochromatic spike
-      the slope is γ=2; broadband averaging can change this).
-    - The ``(1 - C·cos(...))`` factor captures the sinusoidal fringes.
-      It is a direct generalisation of sinc²:
-      ``sinc²(b·r) = (1 - cos(2π·b·r)) / (2π²b²r²)`` — i.e. γ=2, C=1,
-      f=b, with A = 1/(2π²b²).
-    - C is the fringe contrast (0 ≤ C < 1 keeps the model strictly
-      positive in log space; C→1 recovers the sinc² zeros).
-    - f is the fringe spatial frequency (cycles per pixel).
-    - φ is the phase offset.
+    Physical motivation
+    -------------------
+    The background-subtracted diffraction spike radial profile has:
 
-    Unlike fitting sinc² directly, this model never touches zero when C<1,
-    so log-space fitting is well-conditioned.  The oscillation frequency is
-    initialised from an FFT of the envelope-subtracted residuals, avoiding
-    the degenerate b→0 failure mode of the raw sinc² fit.
+    - **Power-law envelope** ``A / r^gamma``: the spike brightness at radius r.
+      For a monochromatic spike γ≈2; broadband averaging can change this.
+
+    - **Sinusoidal fringes** ``cos(2π·f·r + φ)``: the diffraction oscillations
+      (generalised sinc² fringes, with f the spatial frequency set by the
+      spider-vane geometry and wavelength).
+
+    - **Decaying contrast** ``C · exp(-r/r_dec)``: in broadband observations
+      the fringe visibility decreases with radius because chromatic smearing
+      averages over wavelengths — higher-order fringes wash out first.  At
+      small r the full contrast C is seen; at r ≫ r_dec the oscillations
+      vanish and the profile approaches the pure power law.
+
+    Without the decay term a fitter using constant C over-estimates the
+    fringe depth at large r, producing peaks that are too sharp and troughs
+    that are too deep — i.e. more asymmetric than the data.
+
+    The model is strictly positive for all r > 0 when C < 1 (since
+    C·exp(-r/r_dec) ≤ C < 1), so log-space fitting is well-conditioned.
+
+    Parameters
+    ----------
+    A, gamma : float
+        Power-law envelope amplitude and slope.
+    f : float
+        Fringe spatial frequency (cycles per pixel).
+    C : float
+        Maximum fringe contrast at r=0 (0 ≤ C < 1).
+    r_dec : float
+        Contrast e-folding radius (pixels).  Large r_dec → nearly constant
+        contrast; small r_dec → fringes confined to the inner profile.
+    phi : float
+        Phase offset (radians).
     """
-    return (A / r ** gamma) * (1.0 - C * np.cos(2.0 * np.pi * f * r + phi))
+    return (A / r ** gamma) * (1.0 - C * np.exp(-r / r_dec) * np.cos(2.0 * np.pi * f * r + phi))
 
 
-def _log_powerlaw_osc_model(r, A, gamma, f, C, phi):
+def _log_powerlaw_osc_model(r, A, gamma, f, C, r_dec, phi):
     """log₁₀ of ``_powerlaw_osc_model``."""
-    val = _powerlaw_osc_model(r, A, gamma, f, C, phi)
+    val = _powerlaw_osc_model(r, A, gamma, f, C, r_dec, phi)
     return np.log10(np.maximum(val, 1e-30))
 
 
-def _powerlaw_osc_envelope_crossing(A, gamma, C, threshold):
-    """Analytic threshold-crossing radius for the power-law+oscillation model.
+def _powerlaw_osc_envelope_crossing(A, gamma, C, r_dec, threshold):
+    """Numerical threshold-crossing radius for the power-law+oscillation model.
 
-    The upper envelope is ``A·(1+C) / r^gamma`` (cos = -1, oscillation peak).
-    The spike is considered ended when even the oscillation peaks fall below
-    *threshold*:
+    The upper envelope is ``(A/r^gamma) · (1 + C·exp(-r/r_dec))`` — the
+    profile maximum at each r (cos = −1).  The spike is considered ended when
+    even the oscillation peaks fall below *threshold*.
 
-        r_end = (A·(1+C) / threshold)^(1/γ)
+    At large r (r ≫ r_dec) the upper envelope → ``A/r^gamma``, so the crossing
+    always exists provided ``A > threshold``.  The root is found numerically.
 
-    Returns *None* if the envelope amplitude never exceeds *threshold*.
+    Returns *None* if the envelope never exceeds *threshold*.
     """
     if threshold <= 0:
         return None
-    amp = A * (1.0 + C)
-    if amp <= threshold:
+
+    def upper_env(r):
+        return (A / r ** gamma) * (1.0 + C * np.exp(-r / r_dec))
+
+    # Quick check: if the peak of the envelope (at r→0+, ~A·(1+C)/r^γ) is
+    # already below threshold the spike is undetectable.
+    r_start = max(1.0, r_dec * 0.01)
+    if upper_env(r_start) <= threshold:
         return None
-    return float((amp / threshold) ** (1.0 / gamma))
+
+    # Find an r where the envelope has dropped below threshold.
+    r_hi = r_start
+    for _ in range(30):
+        r_hi *= 2.0
+        if upper_env(r_hi) <= threshold:
+            break
+    else:
+        return None  # envelope never drops below threshold in this range
+
+    try:
+        res = root_scalar(lambda r: upper_env(r) - threshold,
+                          bracket=[r_start, r_hi], method='brentq')
+        return float(res.root) if res.converged else None
+    except ValueError:
+        return None
 
 
 def _envelope_model(r, a, b, c, alpha, d):
@@ -463,10 +505,14 @@ def _fit_spike_signal_only(
     C0 = float(np.clip(2.0 * np.abs(fft_coeffs[dominant]) / len(norm_resid), 0.0, 0.9))
     C0 = max(C0, 0.1)   # ensure some oscillation is allowed
 
-    p0 = [A0, gamma0, f0, C0, phase0]
+    # Initial r_dec: half the profile length — fringes decay over roughly half
+    # the observable extent.  The fitter can adjust this freely.
+    r_dec0 = float(r_comb[-1]) / 2.0
+
+    p0 = [A0, gamma0, f0, C0, r_dec0, phase0]
     bounds = (
-        [eps,  0.5, 1.0 / len(r_uni), 0.0, -np.pi],
-        [np.inf, 4.0, 0.5,             0.99,  np.pi],
+        [eps,  0.5, 1.0 / len(r_uni), 0.0,  1.0,    -np.pi],
+        [np.inf, 4.0, 0.5,             0.99,  np.inf,  np.pi],
     )
 
     try:
@@ -1094,9 +1140,9 @@ def measure_spike_lengths(
                 arm_results[label] = (r_cross, radii_arm, p_arm_s, True)
             elif popt is not None:
                 if use_bg_sub:
-                    A_f, gamma_f, _f, C_f, _phi = popt
+                    A_f, gamma_f, _f, C_f, r_dec_f, _phi = popt
                     r_extrap = _powerlaw_osc_envelope_crossing(
-                        A_f, gamma_f, C_f, threshold,
+                        A_f, gamma_f, C_f, r_dec_f, threshold,
                     )
                 else:
                     r_extrap = _find_envelope_crossing(popt, threshold, float(radii_arm[-1]))

@@ -257,22 +257,27 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
                     ax.plot(r_bg, p_bg, ":", color="green", lw=1.0, alpha=0.7,
                             label="Background (ref)")
 
-                # Fitted power-law+oscillation model and its upper envelope
+                # Fitted power-law+oscillation model and its decaying envelopes
                 if sl.popt is not None:
-                    A_f, gamma_f, f_f, C_f, phi_f = sl.popt
+                    A_f, gamma_f, f_f, C_f, r_dec_f, phi_f = sl.popt
                     fit_vals = _powerlaw_osc_model(r_dense, *sl.popt)
-                    env_upper = A_f * (1.0 + C_f) / r_dense ** gamma_f
-                    env_lower = A_f * (1.0 - C_f) / r_dense ** gamma_f
+                    decay = C_f * np.exp(-r_dense / r_dec_f)
+                    pl_env = A_f / r_dense ** gamma_f
+                    env_upper = pl_env * (1.0 + decay)
+                    env_lower = pl_env * (1.0 - decay)
                     ax.plot(r_dense, fit_vals,
                             "-", color="0.35", lw=1.2, alpha=0.8,
-                            label=(f"fit: A={A_f:.2g}, γ={gamma_f:.2f},"
-                                   f" f={f_f:.4f}, C={C_f:.2f}"))
+                            label=(f"fit: γ={gamma_f:.2f}, f={f_f:.4f},"
+                                   f" C={C_f:.2f}, r_dec={r_dec_f:.0f}"))
                     ax.plot(r_dense, env_upper,
                             ":", color="0.55", lw=1.0, alpha=0.7,
                             label="Upper envelope")
                     ax.plot(r_dense, env_lower,
                             ":", color="0.75", lw=1.0, alpha=0.7,
                             label="Lower envelope")
+                    ax.plot(r_dense, pl_env,
+                            "--", color="0.45", lw=0.8, alpha=0.6,
+                            label=f"Power-law (A={A_f:.2g})")
 
                 ylabel = "Signal flux (bg subtracted)"
 
