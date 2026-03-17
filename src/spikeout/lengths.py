@@ -1,4 +1,18 @@
-"""Measure the length of each diffraction-spike arm via Fraunhofer profile fitting."""
+"""Measure the length of each diffraction-spike arm via Fraunhofer profile fitting.
+
+Background-subtraction approach
+--------------------------------
+Rather than fitting the full model ``a·sinc(b·r)² + c/r^α + d`` (5 free
+parameters), we extract background profiles from random angles far from any
+spike, subtract them from the spike-arm profiles, and then fit only the
+sinc² spike signal with 2 free parameters ``(a, b)``.  This avoids the
+dangerous coupled fitting of the stellar core/halo that can fail or produce
+unphysical results.
+
+Care is taken to prevent the background dropping to near zero at large radii
+(which would cause log-log space to diverge): the interpolated background is
+floored at a small positive value before subtraction.
+"""
 
 import numpy as np
 from dataclasses import dataclass
@@ -53,6 +67,7 @@ class SpikeLengths:
     threshold: float = 0.0
     background_profile: Optional[Tuple[np.ndarray, np.ndarray]] = None
     swath_width: float = 0.0
+    background_subtracted: bool = False
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -169,6 +184,12 @@ def _log_fraunhofer_model(r, a, b, c, alpha, d):
     return np.log10(np.maximum(val, 1e-30))
 
 
+def _log_sinc2_model(r, a, b):
+    """log₁₀ of ``a · sinc(b·r)²``, used after background subtraction."""
+    val = a * np.sinc(b * r) ** 2
+    return np.log10(np.maximum(val, 1e-30))
+
+
 def _envelope_model(r, a, b, c, alpha, d):
     """Upper envelope of the Fraunhofer spike model.
 
@@ -232,6 +253,151 @@ def _estimate_p0(r, p):
     print(f"Initial parameter estimates: a={a0:.2e}, b={b0:.2e}, c={c0:.2e}, alpha={alpha0:.2f}, d={d0:.2e}")
 
     return [a0, b0, c0, alpha0, d0]
+
+
+def _fit_spike_signal_only(
+    r_pos: np.ndarray,
+    p_pos: np.ndarray,
+    r_neg: np.ndarray,
+    p_neg: np.ndarray,
+    r_bg: np.ndarray,
+    p_bg: np.ndarray,
+    blank_r: float = 0.0,
+    smooth_size: int = 10,
+    smooth_size_cross: Optional[int] = None,
+    r_min: Optional[float] = None,
+    r_max_fraction: float = 0.7,
+    bg_floor: Optional[float] = None,
+) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
+    """Fit sinc² to background-subtracted spike arm profiles.
+
+    Interpolates the background profile (extracted from off-spike angles) onto
+    each arm's radii and subtracts it, isolating the spike signal.  Only the
+    sinc² parameters ``(a, b)`` are then fitted — 2 free parameters instead of
+    5 — making the fit much more robust.
+
+    The interpolated background is floored at ``bg_floor`` before subtraction
+    to prevent the log-space residual from diverging where the background
+    profile approaches zero at large radii.
+
+    Parameters
+    ----------
+    r_pos, p_pos, r_neg, p_neg : ndarray
+        Arm radii and raw profiles (both arms of one spike).
+    r_bg, p_bg : ndarray
+        Background profile radii and values (median of off-spike angles).
+    blank_r : float
+        Core radius to exclude from fitting.
+    smooth_size, smooth_size_cross : int
+        Median-filter windows for fitting data and endpoint detection.
+    r_min : float or *None*
+        Minimum fitting radius; defaults to ``blank_r``.
+    r_max_fraction : float
+        Upper fitting boundary as fraction of profile length.
+    bg_floor : float or *None*
+        Minimum value used for the interpolated background before subtraction.
+        Prevents near-zero background from causing log-space explosions.
+        Defaults to the 5th percentile of positive background values.
+
+    Returns
+    -------
+    popt : ndarray ``[a, b, 0, 1, 0]`` or *None*
+        Sinc² fit parameters packed for compatibility with
+        ``_find_envelope_crossing``.  Setting ``c=0, alpha=1, d=0`` makes the
+        envelope ``a/(π b r)²``, i.e. the pure sinc² envelope.
+    p_pos_sig_s, p_neg_sig_s : ndarray
+        Background-subtracted profiles smoothed for endpoint detection.
+    """
+    sz_cross = max(1, int(smooth_size_cross if smooth_size_cross is not None
+                          else smooth_size * 2))
+    sz_fit = max(1, max(3, int(smooth_size) // 2))
+    fit_r_min = max(blank_r, r_min if r_min is not None else 1.0)
+
+    # Floor the background to avoid near-zero values causing log-space
+    # divergence (background → 0 ⟹ log(ratio) → ∞ for division, or
+    # negative residuals after subtraction).
+    pos_bg = p_bg[p_bg > 0]
+    if bg_floor is None:
+        bg_floor = float(np.percentile(pos_bg, 5)) if pos_bg.size > 0 else 1e-10
+    bg_floor = max(bg_floor, 1e-10)
+    p_bg_safe = np.maximum(p_bg, bg_floor)
+
+    def _subtract_bg(r_arm, p_arm, sz):
+        """Smooth arm profile with a median filter then subtract background."""
+        p_sm = median_filter(p_arm, size=sz, mode='nearest') if sz > 1 else p_arm.copy()
+        p_bg_interp = np.interp(r_arm, r_bg, p_bg_safe,
+                                left=p_bg_safe[0], right=p_bg_safe[-1])
+        return p_sm - p_bg_interp
+
+    # Lightly smoothed signal profiles for fitting
+    p_pos_sig_fit = _subtract_bg(r_pos, p_pos, sz_fit)
+    p_neg_sig_fit = _subtract_bg(r_neg, p_neg, sz_fit)
+
+    # Heavily smoothed signal profiles for endpoint threshold crossing
+    p_pos_sig_s = _subtract_bg(r_pos, p_pos, sz_cross)
+    p_neg_sig_s = _subtract_bg(r_neg, p_neg, sz_cross)
+
+    # Clip to small positive floor for log-space fitting; keep unclipped for
+    # endpoint detection (so negative values correctly fall below threshold).
+    eps = 1e-30
+    p_pos_clipped = np.maximum(p_pos_sig_fit, eps)
+    p_neg_clipped = np.maximum(p_neg_sig_fit, eps)
+
+    # Build minimum-envelope on a shared radius grid.
+    r_hi_grid = min(float(r_pos[-1]), float(r_neg[-1])) * r_max_fraction
+    r_comb, p_comb = np.array([]), np.array([])
+    if fit_r_min < r_hi_grid:
+        r_grid = np.arange(fit_r_min, r_hi_grid, 1.0)
+        if len(r_grid) >= 6:
+            pp = np.interp(r_grid, r_pos, p_pos_sig_fit)
+            pn = np.interp(r_grid, r_neg, p_neg_sig_fit)
+            # Use minimum envelope; only keep radii where both arms agree the
+            # signal is positive (both above eps before clipping).
+            both_positive = (pp > 0) & (pn > 0)
+            p_min = np.minimum(np.interp(r_grid, r_pos, p_pos_clipped),
+                               np.interp(r_grid, r_neg, p_neg_clipped))
+            valid = both_positive & (p_min > eps)
+            r_comb = r_grid[valid]
+            p_comb = p_min[valid]
+
+    # Fallback: concatenate individually masked arm data.
+    if len(r_comb) < 6:
+        mask_pos = (
+            (r_pos > fit_r_min)
+            & (r_pos < r_max_fraction * float(r_pos[-1]))
+            & (p_pos_sig_fit > 0)
+        )
+        mask_neg = (
+            (r_neg > fit_r_min)
+            & (r_neg < r_max_fraction * float(r_neg[-1]))
+            & (p_neg_sig_fit > 0)
+        )
+        r_comb = np.concatenate([r_pos[mask_pos], r_neg[mask_neg]])
+        p_comb = np.concatenate([p_pos_clipped[mask_pos], p_neg_clipped[mask_neg]])
+
+    if len(r_comb) < 6:
+        return None, p_pos_sig_s, p_neg_sig_s
+
+    # ── Initial parameter estimates for a · sinc(b·r)² ───────────────────
+    a0 = max(float(np.percentile(p_comb, 90)), 1e-10)
+    half_target = 0.5 * a0
+    candidates = r_comb[p_comb >= half_target]
+    r_half = float(candidates[-1]) if len(candidates) else float(r_comb[len(r_comb) // 4])
+    b0 = float(np.clip(0.45 / max(r_half, 1.0), 1e-6, 0.1))
+
+    try:
+        (a_fit, b_fit), _ = curve_fit(
+            _log_sinc2_model, r_comb, np.log10(p_comb),
+            p0=[a0, b0],
+            bounds=([0.0, 1e-6], [np.inf, 0.1]),
+            maxfev=5000,
+        )
+        # Pack as [a, b, c=0, alpha=1, d=0] for _find_envelope_crossing:
+        # _envelope_model(r, a, b, 0, 1, 0) = a/(π b r)² — the sinc² envelope.
+        return np.array([a_fit, b_fit, 0.0, 1.0, 0.0]), p_pos_sig_s, p_neg_sig_s
+    except (RuntimeError, ValueError, TypeError) as e:
+        print(f"sinc² signal fit failed: {e}")
+        return None, p_pos_sig_s, p_neg_sig_s
 
 
 def _fit_shared_halo(
@@ -452,7 +618,7 @@ def _fit_spike_profile(
         return None, p_pos_s, p_neg_s
 
     # ── constrained fit: (a, b) only, halo fixed ──────────────────────────
-    if shared_halo is not None and False:
+    if shared_halo is not None:
         c_s, alpha_s, d_s = shared_halo
 
         def _log_model_ab(r, a, b):
@@ -471,21 +637,15 @@ def _fit_spike_profile(
             (a_fit, b_fit), _ = curve_fit(
                 _log_model_ab, r_comb, np.log10(p_comb),
                 p0=[a0, b0],
-                #bounds=([0.0, 1e-5], [np.inf, 0.1]),
+                bounds=([0.0, 1e-5], [np.inf, 0.1]),
                 maxfev=5000,
             )
-            print(a_fit, b_fit, c_s, alpha_s, d_s)
             return np.array([a_fit, b_fit, c_s, alpha_s, d_s]), p_pos_s, p_neg_s
         except (RuntimeError, ValueError, TypeError):
             pass  # fall through to unconstrained fit
 
     # ── unconstrained fit: all 5 parameters ───────────────────────────────
     p0 = _estimate_p0(r_comb, p_comb)
-    bounds = None #([0, 1e-5, 0, 0.1, 0], [np.inf, 0.1, np.inf, 3.0, np.inf])
-    
-    p0 = np.array([8.78245565e-01, 4.15452670e-03, 2.67775665e+04, 2.34681226e+00,
-       1.42098557e-15])
-    print("Using fixed initial parameters:", p0)
 
     try:
         popt, _ = curve_fit(
@@ -493,12 +653,11 @@ def _fit_spike_profile(
             r_comb,
             np.log10(p_comb),
             p0=p0,
-            #bounds=bounds,
             maxfev=10000,
         )
         return popt, p_pos_s, p_neg_s
     except (RuntimeError, ValueError, TypeError) as e:
-        print(e)
+        print(f"Fraunhofer fit failed: {e}")
         return None, p_pos_s, p_neg_s
 
 
@@ -593,29 +752,46 @@ def measure_spike_lengths(
     median_subtract=False,
     background_profiles=True,
     max_output_length=5000,
+    background_subtract=True,
 ):
     """Measure the length of each detected spike arm.
 
-    Profiles are extracted along each arm from the **raw image** so the
-    full Fraunhofer + halo signal is available for fitting.  Both arms of
-    each spike are smoothed with a median filter, then jointly fitted in
-    log₁₀ space to the model
+    Background-subtraction mode (``background_subtract=True``, default)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Profiles from random angles far from any spike are extracted and
+    median-combined to form a background profile that captures the stellar
+    halo + sky at each radius.  This is subtracted from each spike arm
+    profile, isolating the diffraction-spike signal.  Only the sinc²
+    parameters ``(a, b)`` are then fitted (2 free parameters), giving a
+    robust fit that does not require the halo/core to be modelled jointly
+    with the spike.
+
+    The interpolated background is floored before subtraction to prevent
+    log-space divergence where the background profile approaches zero at
+    large radii.
+
+    The arm endpoint threshold becomes ``length_sigma × σ_sky`` (not
+    ``background + length_sigma × σ_sky``) because the background has
+    already been subtracted.
+
+    Full-model mode (``background_subtract=False``)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Both arms of each spike are jointly fitted in log₁₀ space to the model
 
         ``f(r) = a · sinc(b r)²  +  c / r^α  +  d``
 
-    where the sinc² term captures the diffraction spike oscillations, the
-    power law captures the stellar halo, and ``d`` is the background floor.
+    where the halo parameters ``(c, α, d)`` are first estimated from all
+    arms combined (``_fit_shared_halo``), then held fixed while ``(a, b)``
+    are refined per spike.  Falls back to the unconstrained 5-parameter fit
+    if the shared-halo estimate is unavailable.
 
-    The halo parameters ``(c, alpha, d)`` are the same for all spikes on a
-    given star (azimuthal symmetry of the PSF), so they are fitted once from
-    all arms combined before the per-spike ``(a, b)`` fit.  This significantly
-    improves robustness for short profiles and for stars with many spikes.
-
-    The arm endpoint is where the smoothed profile first drops below a
-    background threshold **and** the Fraunhofer envelope also predicts the
-    spike has ended (preventing sinc² oscillation troughs from being mistaken
-    for the end).  If the spike extends to the profile edge, the envelope is
-    used to extrapolate; ``SpikeLengths.converged_pos/neg`` is *False* then.
+    Common behaviour
+    ~~~~~~~~~~~~~~~~
+    The arm endpoint is where the smoothed profile first drops below the
+    threshold **and** the model envelope also predicts the spike has ended,
+    preventing sinc² oscillation troughs from being mistaken for the end.
+    If the spike extends to the profile edge the envelope is extrapolated;
+    ``SpikeLengths.converged_pos/neg`` is *False* in that case.
 
     Parameters
     ----------
@@ -627,9 +803,9 @@ def measure_spike_lengths(
         Width (pixels) of the perpendicular sampling band.  Default:
         ``max(3, min(image.shape) * 0.02)``.
     length_sigma : float
-        Arm endpoint threshold: ``background + length_sigma × σ_sky``,
-        where ``σ_sky`` is the per-pixel sky noise estimated from
-        pixel-to-pixel differences in the outer image annulus.
+        Arm endpoint threshold multiplier applied to the sky noise ``σ_sky``.
+        In background-subtract mode the threshold is ``length_sigma × σ_sky``;
+        in full-model mode it is ``background + length_sigma × σ_sky``.
     centre : (row, col) or *None*
         Star centre.  Auto-detected if *None*.
     radial_bin_width : int
@@ -640,26 +816,27 @@ def measure_spike_lengths(
     smooth_size_cross : int or *None*
         Median-filter window applied to each arm profile for threshold
         crossing / endpoint detection.  Defaults to ``2 * smooth_size``.
-        A larger window suppresses noise spikes in the faint outer tail.
     r_min : float or *None*
-        Minimum radius included in the log-space fit.  Defaults to the
-        blank-core radius (so saturated/NaN cores are excluded).
+        Minimum radius included in the fit.  Defaults to the blank-core
+        radius (so saturated/NaN cores are excluded).
     r_max_fraction : float
         Upper boundary of the fitting region as a fraction of the profile
-        length.  The noisy outer tail (beyond this fraction) is excluded
-        from the fit but used for the threshold crossing.  Default 0.7.
+        length.  Default 0.7.
     max_radius : float or *None*
-        Maximum swath-walk radius (pixels).  Defaults to the image
-        diagonal — set smaller to limit profile extraction cost.
+        Maximum swath-walk radius (pixels).  Defaults to the image diagonal.
     median_subtract : bool
         If *True*, subtract the azimuthal median from the image before
-        measuring lengths.  This can help isolate the spike profile from the
-        PSF halo, but may not be desirable if the halo is very asymmetric.
+        measuring lengths.
     background_profiles : bool
-        If *True*, extract background profiles from random angles for 
-        sanity check and potential future use.
+        If *True* (or when ``background_subtract=True``), extract background
+        profiles from random off-spike angles.  Always forced *True* when
+        ``background_subtract=True``.
     max_output_length : int
-        Maximum length of each arm allowed.
+        Maximum length of each arm allowed (pixels).
+    background_subtract : bool
+        If *True* (default), subtract the median background profile from each
+        spike arm before fitting, then fit only the sinc² signal.  If *False*,
+        use the full 5-parameter Fraunhofer fit.
 
     Returns
     -------
@@ -668,7 +845,7 @@ def measure_spike_lengths(
     image = np.asarray(image, dtype=float)
 
     # Blank-core radius — needed to skip corrupted inner profile segment
-    blank_r = _blank_core_radius(image, centre=centre) + 3.0  # add small margin to ensure all blank pixels are excluded
+    blank_r = _blank_core_radius(image, centre=centre) + 3.0
 
     # Working copy with NaNs filled so swath sampling always has data
     img = image.copy()
@@ -685,7 +862,6 @@ def measure_spike_lengths(
         bg_level = 0.0
     else:
         residual = image
-        # Background level: median of outer image annulus (far from star).
         bg_level = None  # computed below after cy/cx are set
 
     if swath_width is None:
@@ -699,9 +875,7 @@ def measure_spike_lengths(
 
     # ── Background noise via pixel-to-pixel differences ───────────────────
     # Differencing adjacent pixels cancels the smooth PSF halo gradient,
-    # leaving only sky noise.  This gives the true per-pixel sigma even for
-    # very bright stars where mad_std on the raw image is inflated by the
-    # halo signal by 10× or more.
+    # leaving only sky noise.
     Y_g, X_g = np.ogrid[:ny, :nx]
     R_from_centre = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
     r_noise_annulus = 0.75 * min(ny, nx) / 2.0
@@ -724,8 +898,6 @@ def measure_spike_lengths(
         bg_level = float(np.median(outer_px)) if outer_px.size >= 10 \
             else float(np.median(img[np.isfinite(img)]))
 
-    threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
-
     theta = result.theta
     pk_th = result.peak_theta_indices
 
@@ -746,59 +918,89 @@ def measure_spike_lengths(
             max_radius=max_radius,
         )
         arm_profiles.append((r_pos, p_pos, r_neg, p_neg, x0, y0, angle))
-    
-    if background_profiles:
-        background_profiles = []
+
+    # ── Background profile extraction ────────────────────────────────────
+    # Always extract when using background subtraction; optionally otherwise.
+    bg_profile_data: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    if background_subtract or background_profiles:
+        bg_samples = []
         random_angles = np.random.uniform(0, 360, size=40)
-        # Pick 6 angles with are > 10 degrees away from any spike arm, and extract background profiles there for sanity check and potential future use.
         for bg_angle in random_angles:
+            # Require > 10° separation from every spike arm direction.
             if np.all(np.abs((bg_angle - result.angles + 180) % 360 - 180) > 10):
-                r_bg, p_bg = _extract_swath_profile(
+                r_bg_s, p_bg_s = _extract_swath_profile(
                     img, cx, cy, bg_angle, swath_width, max_radius=max_radius,
                 )
-                background_profiles.append((r_bg, p_bg, bg_angle))
-            if len(background_profiles) >= 6:
+                bg_samples.append((r_bg_s, p_bg_s))
+            if len(bg_samples) >= 6:
                 break
 
-    # compute median background profile for sanity check
-    if background_profiles:
-        r_bg_comb = np.concatenate([r for r, p, a in background_profiles])
-        p_bg_comb = np.concatenate([p for r, p, a in background_profiles])
-        r_bg_sorted = np.sort(r_bg_comb)
-        p_bg_sorted = p_bg_comb[np.argsort(r_bg_comb)]
-        sz = max(1, int(smooth_size))
-        p_bg_smooth = median_filter(p_bg_sorted, size=sz, mode='nearest') if sz > 1 else p_bg_sorted.copy()
-        
-    # ── Shared halo fit: (c, alpha, d) from all arms jointly ─────────────
-    # The PSF halo is azimuthally symmetric, so these parameters are the
-    # same for every spike arm.  Fitting from all arms gives far more data
-    # than any single arm and makes the 5-parameter per-spike fit tractable.
-    # Pairs are passed so the halo fitter can form minimum-envelope profiles.
-    arm_pairs = [
-        (r_pos, p_pos, r_neg, p_neg)
-        for (r_pos, p_pos, r_neg, p_neg, *_) in arm_profiles
-    ]
-    shared_halo = _fit_shared_halo(
-        arm_pairs,
-        blank_r=blank_r,
-        smooth_size=smooth_size,
-        r_min=r_min,
-        r_max_fraction=r_max_fraction,
-    )
+        if bg_samples:
+            # Combine all samples onto a sorted radius grid and median-smooth.
+            r_bg_comb = np.concatenate([r for r, p in bg_samples])
+            p_bg_comb = np.concatenate([p for r, p in bg_samples])
+            sort_idx = np.argsort(r_bg_comb)
+            r_bg_sorted = r_bg_comb[sort_idx]
+            p_bg_sorted = p_bg_comb[sort_idx]
+            sz = max(1, int(smooth_size))
+            p_bg_smooth = (
+                median_filter(p_bg_sorted, size=sz, mode='nearest')
+                if sz > 1 else p_bg_sorted.copy()
+            )
+            bg_profile_data = (r_bg_sorted, p_bg_smooth)
+
+    # ── Threshold ─────────────────────────────────────────────────────────
+    if background_subtract and bg_profile_data is not None:
+        # After subtracting the background the signal should be zero in
+        # sky-only regions; threshold is purely noise-based.
+        threshold = length_sigma * max(sigma_bg, 1e-10)
+    else:
+        threshold = bg_level + length_sigma * max(sigma_bg, 1e-10)
 
     # ── Pass 2: per-spike fit and model-aware endpoint detection ──────────
+    # Choose fitting strategy: background-subtract (preferred) or full model.
+    use_bg_sub = background_subtract and bg_profile_data is not None
+
+    if not use_bg_sub:
+        # Pre-compute shared halo for the full-model path.
+        arm_pairs = [
+            (r_pos, p_pos, r_neg, p_neg)
+            for (r_pos, p_pos, r_neg, p_neg, *_) in arm_profiles
+        ]
+        shared_halo = _fit_shared_halo(
+            arm_pairs,
+            blank_r=blank_r,
+            smooth_size=smooth_size,
+            r_min=r_min,
+            r_max_fraction=r_max_fraction,
+        )
+    else:
+        shared_halo = None
+
     lengths = []
     for r_pos, p_pos, r_neg, p_neg, x0, y0, angle in arm_profiles:
 
-        popt, p_pos_s, p_neg_s = _fit_spike_profile(
-            r_pos, p_pos, r_neg, p_neg,
-            blank_r=blank_r,
-            smooth_size=smooth_size,
-            smooth_size_cross=smooth_size_cross,
-            r_min=r_min,
-            r_max_fraction=r_max_fraction,
-            shared_halo=shared_halo,
-        )
+        if use_bg_sub:
+            r_bg_fit, p_bg_fit = bg_profile_data
+            popt, p_pos_s, p_neg_s = _fit_spike_signal_only(
+                r_pos, p_pos, r_neg, p_neg,
+                r_bg_fit, p_bg_fit,
+                blank_r=blank_r,
+                smooth_size=smooth_size,
+                smooth_size_cross=smooth_size_cross,
+                r_min=r_min,
+                r_max_fraction=r_max_fraction,
+            )
+        else:
+            popt, p_pos_s, p_neg_s = _fit_spike_profile(
+                r_pos, p_pos, r_neg, p_neg,
+                blank_r=blank_r,
+                smooth_size=smooth_size,
+                smooth_size_cross=smooth_size_cross,
+                r_min=r_min,
+                r_max_fraction=r_max_fraction,
+                shared_halo=shared_halo,
+            )
 
         arm_results = {}
         for label, radii_arm, p_arm_s in [
@@ -813,8 +1015,6 @@ def measure_spike_lengths(
             elif popt is not None:
                 r_extrap = _find_envelope_crossing(popt, threshold, float(radii_arm[-1]))
                 if r_extrap is not None:
-                    # If fitting fails weirdly but profile crossing is raised, use max radius of the profile as the length and mark as unconverged.  
-                    # This is a fallback for cases where the fit is so bad that the envelope crossing fails, but the profile crossing still gives a reasonable length.
                     if r_extrap < float(radii_arm[-1]):
                         r_extrap = float(radii_arm[-1])
                     arm_results[label] = (r_extrap, radii_arm, p_arm_s, False)
@@ -824,9 +1024,9 @@ def measure_spike_lengths(
                 arm_results[label] = (float(radii_arm[-1]), radii_arm, p_arm_s, False)
 
         if arm_results["pos"][0] > max_output_length:
-            arm_results["pos"] = (max_output_length, arm_results["pos"][1], arm_results["pos"][2], arm_results["pos"][3])
+            arm_results["pos"] = (max_output_length, *arm_results["pos"][1:])
         if arm_results["neg"][0] > max_output_length:
-            arm_results["neg"] = (max_output_length, arm_results["neg"][1], arm_results["neg"][2], arm_results["neg"][3])
+            arm_results["neg"] = (max_output_length, *arm_results["neg"][1:])
 
         lengths.append(SpikeLengths(
             angle_deg=angle,
@@ -841,8 +1041,9 @@ def measure_spike_lengths(
             converged_neg=arm_results["neg"][3],
             popt=popt,
             threshold=threshold,
-            background_profile=(r_bg_sorted, p_bg_smooth) if background_profiles else None,
+            background_profile=bg_profile_data,
             swath_width=swath_width,
+            background_subtracted=use_bg_sub,
         ))
 
     return lengths

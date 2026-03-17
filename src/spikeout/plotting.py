@@ -7,7 +7,7 @@ from .stats import mad_std
 from .detect import detect
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .preprocess import azimuthal_median
-from .lengths import _fraunhofer_model, _envelope_model
+from .lengths import _fraunhofer_model, _envelope_model, _log_sinc2_model
 
 __all__ = ["plot_diagnostics"]
 
@@ -51,7 +51,6 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
     centre_row = n_rho // 2
     # Use the actual acceptance band stored in the result (includes blank_r
     # for saturated stars) rather than recomputing from max_rho_fraction alone.
-    print('check', result.max_rho_px)
     max_rho_px = result.max_rho_px if result.max_rho_px > 0 \
         else max_rho_fraction * min(image.shape) / 2.0
 
@@ -231,69 +230,104 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
             sl = result.lengths[i]
             color = colors[i % len(colors)]
 
-            # Raw smoothed arm profiles
-            ax.semilogy(sl.radii_pos, np.maximum(sl.profile_pos, 1e-30),
+            r_all = np.concatenate([sl.radii_pos, sl.radii_neg])
+            r_dense = np.linspace(max(r_all.min(), 0.5), r_all.max(), 400)
+
+            if sl.background_subtracted:
+                # ── Background-subtracted mode ────────────────────────────
+                # Profiles are already signal (bg removed); use symlog so
+                # near-zero and slightly negative noise values are visible.
+                linthresh = max(sl.threshold, 1e-6) if sl.threshold > 0 else 1e-4
+
+                ax.set_yscale("symlog", linthresh=linthresh)
+
+                ax.plot(sl.radii_pos, sl.profile_pos,
                         "-", color=color, lw=1.2,
                         label=f"+ arm ({sl.length_pos:.0f} px"
                               + ("" if sl.converged_pos else ", extrap") + ")")
-            ax.semilogy(sl.radii_neg, np.maximum(sl.profile_neg, 1e-30),
+                ax.plot(sl.radii_neg, sl.profile_neg,
                         "--", color=color, lw=1.2,
                         label=f"− arm ({sl.length_neg:.0f} px"
                               + ("" if sl.converged_neg else ", extrap") + ")")
 
-            # Fix ylims to avoid autoscaling to the noise floor in long arms
-            low = 0.1*sl.threshold if sl.threshold > 0 else 1e-4
-            ax.set_ylim(low, ax.get_ylim()[1])
+                # Background profile shown for reference
+                if sl.background_profile is not None:
+                    r_bg, p_bg = sl.background_profile
+                    ax.plot(r_bg, p_bg, ":", color="green", lw=1.0, alpha=0.7,
+                            label="Background (ref)")
 
-            if result.lengths[i].background_profile is not None:
-                r_bg, p_bg = result.lengths[i].background_profile
-                ax.semilogy(r_bg, np.maximum(p_bg, 1e-30), ":", color="green",
-                            lw=1.0, alpha=0.7, label="Background profile")
-
-            # Fraunhofer fit + envelope
-            if sl.popt is not None:
-                r_all = np.concatenate([sl.radii_pos, sl.radii_neg])
-                r_dense = np.linspace(max(r_all.min(), 0.5), r_all.max(), 400)
-                fit_vals = _fraunhofer_model(r_dense, *sl.popt)
-                env_vals = _envelope_model(r_dense, *sl.popt)
-                ax.semilogy(r_dense, np.maximum(fit_vals, 1e-30),
-                            "-", color="0.35", lw=1.0, alpha=0.7,
-                            label="Fraunhofer fit")
-                ax.semilogy(r_dense, np.maximum(env_vals, 1e-30),
+                # Fitted sinc² model and its envelope
+                if sl.popt is not None:
+                    a, b = sl.popt[0], sl.popt[1]
+                    fit_vals = a * np.sinc(b * r_dense) ** 2
+                    env_vals = a / (np.pi * b * r_dense) ** 2
+                    ax.plot(r_dense, fit_vals,
+                            "-", color="0.35", lw=1.2, alpha=0.8,
+                            label=f"sinc² fit (a={a:.2g}, b={b:.2g})")
+                    ax.plot(r_dense, env_vals,
                             ":", color="0.35", lw=1.0, alpha=0.7,
                             label="Envelope")
 
-                # Plot core component of the fit as a separate dashed line to show how much of the profile is explained by the core vs. the envelope.
-                # is c / r ** alpha + d
-                # full components are r, a, b, c, alpha, d
-                core_vals = sl.popt[2] / r_dense ** sl.popt[3] + sl.popt[4]
-                ax.semilogy(r_dense, np.maximum(core_vals, 1e-30),
-                            "--", color="0.35", lw=1.0, alpha=0.7,
-                            label="Core")
+                ylabel = "Signal flux (bg subtracted)"
 
-            # Detection threshold
+            else:
+                # ── Full Fraunhofer model mode ────────────────────────────
+                ax.semilogy(sl.radii_pos, np.maximum(sl.profile_pos, 1e-30),
+                            "-", color=color, lw=1.2,
+                            label=f"+ arm ({sl.length_pos:.0f} px"
+                                  + ("" if sl.converged_pos else ", extrap") + ")")
+                ax.semilogy(sl.radii_neg, np.maximum(sl.profile_neg, 1e-30),
+                            "--", color=color, lw=1.2,
+                            label=f"− arm ({sl.length_neg:.0f} px"
+                                  + ("" if sl.converged_neg else ", extrap") + ")")
+
+                # Fix ylims to avoid autoscaling to the noise floor in long arms
+                low = 0.1 * sl.threshold if sl.threshold > 0 else 1e-4
+                ax.set_ylim(low, ax.get_ylim()[1])
+
+                if sl.background_profile is not None:
+                    r_bg, p_bg = sl.background_profile
+                    ax.semilogy(r_bg, np.maximum(p_bg, 1e-30), ":", color="green",
+                                lw=1.0, alpha=0.7, label="Background profile")
+
+                if sl.popt is not None:
+                    fit_vals = _fraunhofer_model(r_dense, *sl.popt)
+                    env_vals = _envelope_model(r_dense, *sl.popt)
+                    ax.semilogy(r_dense, np.maximum(fit_vals, 1e-30),
+                                "-", color="0.35", lw=1.0, alpha=0.7,
+                                label="Fraunhofer fit")
+                    ax.semilogy(r_dense, np.maximum(env_vals, 1e-30),
+                                ":", color="0.35", lw=1.0, alpha=0.7,
+                                label="Envelope")
+                    # Halo + background component
+                    halo_vals = sl.popt[2] / r_dense ** sl.popt[3] + sl.popt[4]
+                    ax.semilogy(r_dense, np.maximum(halo_vals, 1e-30),
+                                "--", color="0.35", lw=1.0, alpha=0.7,
+                                label="Halo + bg")
+
+                ylabel = "Swath median flux"
+
+            # Detection threshold — common to both modes
             if sl.threshold > 0:
                 ax.axhline(sl.threshold, color="grey", ls=":", lw=1,
                            label=f"threshold ({sl.threshold:.2g})")
 
             # Arm endpoint markers (filled = converged, open = extrapolated)
-            ymin_ax = ax.get_ylim()[0] if ax.get_ylim()[0] > 0 else 1e-30
             for arm_len, ls, converged in [
                 (sl.length_pos, "-", sl.converged_pos),
                 (sl.length_neg, "--", sl.converged_neg),
             ]:
                 ax.axvline(arm_len, color=color, ls=ls, lw=0.8, alpha=0.5)
-                marker = "o" if converged else "^"
                 if sl.threshold > 0:
+                    marker = "o" if converged else "^"
                     ax.plot(arm_len, sl.threshold, marker,
                             color=color, ms=6,
                             mfc=color if converged else "none", mew=1.5)
 
             ax.set(
-                xlabel="Radius (pixels)", ylabel="Swath median flux",
+                xlabel="Radius (pixels)", ylabel=ylabel,
                 title=f"Spike @ {sl.angle_deg:.1f}°",
             )
             ax.legend(fontsize=12)
-            ax.set_yscale("log")
 
     return fig
