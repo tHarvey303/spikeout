@@ -7,7 +7,8 @@ from .stats import mad_std
 from .detect import detect
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .preprocess import azimuthal_median
-from .lengths import _fraunhofer_model, _envelope_model, _log_sinc2_model
+from .lengths import (_fraunhofer_model, _envelope_model,
+                      _powerlaw_osc_model)
 
 __all__ = ["plot_diagnostics"]
 
@@ -256,17 +257,22 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
                     ax.plot(r_bg, p_bg, ":", color="green", lw=1.0, alpha=0.7,
                             label="Background (ref)")
 
-                # Fitted sinc² model and its envelope
+                # Fitted power-law+oscillation model and its upper envelope
                 if sl.popt is not None:
-                    a, b = sl.popt[0], sl.popt[1]
-                    fit_vals = a * np.sinc(b * r_dense) ** 2
-                    env_vals = a / (np.pi * b * r_dense) ** 2
+                    A_f, gamma_f, f_f, C_f, phi_f = sl.popt
+                    fit_vals = _powerlaw_osc_model(r_dense, *sl.popt)
+                    env_upper = A_f * (1.0 + C_f) / r_dense ** gamma_f
+                    env_lower = A_f * (1.0 - C_f) / r_dense ** gamma_f
                     ax.plot(r_dense, fit_vals,
                             "-", color="0.35", lw=1.2, alpha=0.8,
-                            label=f"sinc² fit (a={a:.2g}, b={b:.2g})")
-                    ax.plot(r_dense, env_vals,
-                            ":", color="0.35", lw=1.0, alpha=0.7,
-                            label="Envelope")
+                            label=(f"fit: A={A_f:.2g}, γ={gamma_f:.2f},"
+                                   f" f={f_f:.4f}, C={C_f:.2f}"))
+                    ax.plot(r_dense, env_upper,
+                            ":", color="0.55", lw=1.0, alpha=0.7,
+                            label="Upper envelope")
+                    ax.plot(r_dense, env_lower,
+                            ":", color="0.75", lw=1.0, alpha=0.7,
+                            label="Lower envelope")
 
                 ylabel = "Signal flux (bg subtracted)"
 

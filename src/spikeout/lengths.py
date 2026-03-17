@@ -39,7 +39,10 @@ class SpikeLengths:
     length_total : float
         Sum of both arms.
     profile_pos, profile_neg : ndarray
-        Median-smoothed swath profile along each arm (raw-image values).
+        Median-smoothed swath profile along each arm used for endpoint
+        detection.  When ``background_subtracted`` is *True* these are the
+        background-subtracted signal profiles; otherwise they are the raw
+        swath values.
     radii_pos, radii_neg : ndarray
         Radial distance array for each arm (pixels from star centre).
     converged_pos, converged_neg : bool
@@ -190,6 +193,57 @@ def _log_sinc2_model(r, a, b):
     return np.log10(np.maximum(val, 1e-30))
 
 
+def _powerlaw_osc_model(r, A, gamma, f, C, phi):
+    """Power-law envelope modulated by a sinusoidal oscillation.
+
+    ``(A / r^gamma) · (1 - C · cos(2π·f·r + φ))``
+
+    This is the physically correct model for the background-subtracted
+    diffraction spike radial profile:
+    - ``A / r^gamma`` is the power-law envelope (for a monochromatic spike
+      the slope is γ=2; broadband averaging can change this).
+    - The ``(1 - C·cos(...))`` factor captures the sinusoidal fringes.
+      It is a direct generalisation of sinc²:
+      ``sinc²(b·r) = (1 - cos(2π·b·r)) / (2π²b²r²)`` — i.e. γ=2, C=1,
+      f=b, with A = 1/(2π²b²).
+    - C is the fringe contrast (0 ≤ C < 1 keeps the model strictly
+      positive in log space; C→1 recovers the sinc² zeros).
+    - f is the fringe spatial frequency (cycles per pixel).
+    - φ is the phase offset.
+
+    Unlike fitting sinc² directly, this model never touches zero when C<1,
+    so log-space fitting is well-conditioned.  The oscillation frequency is
+    initialised from an FFT of the envelope-subtracted residuals, avoiding
+    the degenerate b→0 failure mode of the raw sinc² fit.
+    """
+    return (A / r ** gamma) * (1.0 - C * np.cos(2.0 * np.pi * f * r + phi))
+
+
+def _log_powerlaw_osc_model(r, A, gamma, f, C, phi):
+    """log₁₀ of ``_powerlaw_osc_model``."""
+    val = _powerlaw_osc_model(r, A, gamma, f, C, phi)
+    return np.log10(np.maximum(val, 1e-30))
+
+
+def _powerlaw_osc_envelope_crossing(A, gamma, C, threshold):
+    """Analytic threshold-crossing radius for the power-law+oscillation model.
+
+    The upper envelope is ``A·(1+C) / r^gamma`` (cos = -1, oscillation peak).
+    The spike is considered ended when even the oscillation peaks fall below
+    *threshold*:
+
+        r_end = (A·(1+C) / threshold)^(1/γ)
+
+    Returns *None* if the envelope amplitude never exceeds *threshold*.
+    """
+    if threshold <= 0:
+        return None
+    amp = A * (1.0 + C)
+    if amp <= threshold:
+        return None
+    return float((amp / threshold) ** (1.0 / gamma))
+
+
 def _envelope_model(r, a, b, c, alpha, d):
     """Upper envelope of the Fraunhofer spike model.
 
@@ -269,16 +323,22 @@ def _fit_spike_signal_only(
     r_max_fraction: float = 0.7,
     bg_floor: Optional[float] = None,
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
-    """Fit sinc² to background-subtracted spike arm profiles.
+    """Fit a power-law+oscillation model to background-subtracted spike profiles.
 
-    Interpolates the background profile (extracted from off-spike angles) onto
-    each arm's radii and subtracts it, isolating the spike signal.  Only the
-    sinc² parameters ``(a, b)`` are then fitted — 2 free parameters instead of
-    5 — making the fit much more robust.
+    Interpolates the background profile (from off-spike angles) onto each
+    arm's radii and subtracts it, then fits:
 
-    The interpolated background is floored at ``bg_floor`` before subtraction
-    to prevent the log-space residual from diverging where the background
-    profile approaches zero at large radii.
+        ``signal(r) = (A / r^γ) · (1 − C · cos(2π·f·r + φ))``
+
+    This is the physically correct model: the radial spike profile has a
+    power-law envelope (γ≈2 for monochromatic; broadband can differ) with
+    sinusoidal fringes from diffraction.  Unlike fitting sinc² directly,
+    C < 1 keeps the model strictly positive so log-space fitting is
+    well-conditioned and the optimizer cannot escape into the b→0 degenerate
+    solution.
+
+    The oscillation frequency ``f`` is initialised from an FFT of the
+    envelope-subtracted residuals.
 
     Parameters
     ----------
@@ -295,16 +355,14 @@ def _fit_spike_signal_only(
     r_max_fraction : float
         Upper fitting boundary as fraction of profile length.
     bg_floor : float or *None*
-        Minimum value used for the interpolated background before subtraction.
-        Prevents near-zero background from causing log-space explosions.
-        Defaults to the 5th percentile of positive background values.
+        Minimum background value before subtraction.  Prevents near-zero
+        background from causing log-space explosions.  Defaults to the 5th
+        percentile of positive background values.
 
     Returns
     -------
-    popt : ndarray ``[a, b, 0, 1, 0]`` or *None*
-        Sinc² fit parameters packed for compatibility with
-        ``_find_envelope_crossing``.  Setting ``c=0, alpha=1, d=0`` makes the
-        envelope ``a/(π b r)²``, i.e. the pure sinc² envelope.
+    popt : ndarray ``[A, gamma, f, C, phi]`` or *None*
+        Fitted parameters of ``_powerlaw_osc_model``.
     p_pos_sig_s, p_neg_sig_s : ndarray
         Background-subtracted profiles smoothed for endpoint detection.
     """
@@ -314,8 +372,7 @@ def _fit_spike_signal_only(
     fit_r_min = max(blank_r, r_min if r_min is not None else 1.0)
 
     # Floor the background to avoid near-zero values causing log-space
-    # divergence (background → 0 ⟹ log(ratio) → ∞ for division, or
-    # negative residuals after subtraction).
+    # divergence after subtraction.
     pos_bg = p_bg[p_bg > 0]
     if bg_floor is None:
         bg_floor = float(np.percentile(pos_bg, 5)) if pos_bg.size > 0 else 1e-10
@@ -323,7 +380,6 @@ def _fit_spike_signal_only(
     p_bg_safe = np.maximum(p_bg, bg_floor)
 
     def _subtract_bg(r_arm, p_arm, sz):
-        """Smooth arm profile with a median filter then subtract background."""
         p_sm = median_filter(p_arm, size=sz, mode='nearest') if sz > 1 else p_arm.copy()
         p_bg_interp = np.interp(r_arm, r_bg, p_bg_safe,
                                 left=p_bg_safe[0], right=p_bg_safe[-1])
@@ -337,11 +393,7 @@ def _fit_spike_signal_only(
     p_pos_sig_s = _subtract_bg(r_pos, p_pos, sz_cross)
     p_neg_sig_s = _subtract_bg(r_neg, p_neg, sz_cross)
 
-    # Clip to small positive floor for log-space fitting; keep unclipped for
-    # endpoint detection (so negative values correctly fall below threshold).
     eps = 1e-30
-    p_pos_clipped = np.maximum(p_pos_sig_fit, eps)
-    p_neg_clipped = np.maximum(p_neg_sig_fit, eps)
 
     # Build minimum-envelope on a shared radius grid.
     r_hi_grid = min(float(r_pos[-1]), float(r_neg[-1])) * r_max_fraction
@@ -351,11 +403,8 @@ def _fit_spike_signal_only(
         if len(r_grid) >= 6:
             pp = np.interp(r_grid, r_pos, p_pos_sig_fit)
             pn = np.interp(r_grid, r_neg, p_neg_sig_fit)
-            # Use minimum envelope; only keep radii where both arms agree the
-            # signal is positive (both above eps before clipping).
             both_positive = (pp > 0) & (pn > 0)
-            p_min = np.minimum(np.interp(r_grid, r_pos, p_pos_clipped),
-                               np.interp(r_grid, r_neg, p_neg_clipped))
+            p_min = np.minimum(np.maximum(pp, eps), np.maximum(pn, eps))
             valid = both_positive & (p_min > eps)
             r_comb = r_grid[valid]
             p_comb = p_min[valid]
@@ -373,30 +422,61 @@ def _fit_spike_signal_only(
             & (p_neg_sig_fit > 0)
         )
         r_comb = np.concatenate([r_pos[mask_pos], r_neg[mask_neg]])
-        p_comb = np.concatenate([p_pos_clipped[mask_pos], p_neg_clipped[mask_neg]])
+        p_comb = np.concatenate([
+            np.maximum(p_pos_sig_fit[mask_pos], eps),
+            np.maximum(p_neg_sig_fit[mask_neg], eps),
+        ])
 
     if len(r_comb) < 6:
         return None, p_pos_sig_s, p_neg_sig_s
 
-    # ── Initial parameter estimates for a · sinc(b·r)² ───────────────────
-    a0 = max(float(np.percentile(p_comb, 90)), 1e-10)
-    half_target = 0.5 * a0
-    candidates = r_comb[p_comb >= half_target]
-    r_half = float(candidates[-1]) if len(candidates) else float(r_comb[len(r_comb) // 4])
-    b0 = float(np.clip(0.45 / max(r_half, 1.0), 1e-6, 0.1))
+    # ── Step 1: fit power-law envelope in log-log space ───────────────────
+    # Use the upper percentile at each radius to trace the envelope rather
+    # than the raw minimum, since oscillation troughs pull the minimum down.
+    try:
+        slope, intercept = np.polyfit(np.log10(r_comb), np.log10(p_comb), 1)
+        gamma0 = float(np.clip(-slope, 0.5, 4.0))
+        A0 = float(10.0 ** intercept)
+    except Exception:
+        gamma0 = 2.0
+        A0 = float(np.median(p_comb)) * float(np.median(r_comb)) ** gamma0
+    A0 = max(A0, eps)
+
+    # ── Step 2: estimate oscillation frequency from FFT of residuals ──────
+    # Interpolate onto a uniform 1-px grid, divide by the fitted envelope,
+    # then FFT to find the dominant fringe frequency.
+    r_uni = np.arange(r_comb[0], r_comb[-1] + 1, 1.0)
+    p_uni = np.interp(r_uni, r_comb, p_comb)
+    envelope0 = A0 / r_uni ** gamma0
+    # Normalised residual: (signal / envelope) - 1  ∈ [-1, +1]
+    norm_resid = p_uni / np.maximum(envelope0, eps) - 1.0
+    fft_coeffs = np.fft.rfft(norm_resid)
+    freqs = np.fft.rfftfreq(len(norm_resid), d=1.0)
+    # Ignore DC (index 0); find dominant positive frequency
+    power = np.abs(fft_coeffs[1:]) ** 2
+    dominant = int(np.argmax(power)) + 1
+    f0 = float(freqs[dominant])
+    f0 = max(f0, 1.0 / len(r_uni))   # at least one cycle over the profile
+
+    # ── Step 3: initial C and phi from the dominant FFT component ─────────
+    phase0 = float(np.angle(fft_coeffs[dominant]))
+    C0 = float(np.clip(2.0 * np.abs(fft_coeffs[dominant]) / len(norm_resid), 0.0, 0.9))
+    C0 = max(C0, 0.1)   # ensure some oscillation is allowed
+
+    p0 = [A0, gamma0, f0, C0, phase0]
+    bounds = (
+        [eps,  0.5, 1.0 / len(r_uni), 0.0, -np.pi],
+        [np.inf, 4.0, 0.5,             0.99,  np.pi],
+    )
 
     try:
-        (a_fit, b_fit), _ = curve_fit(
-            _log_sinc2_model, r_comb, np.log10(p_comb),
-            p0=[a0, b0],
-            bounds=([0.0, 1e-6], [np.inf, 0.1]),
-            maxfev=5000,
+        popt, _ = curve_fit(
+            _log_powerlaw_osc_model, r_comb, np.log10(p_comb),
+            p0=p0, bounds=bounds, maxfev=10000,
         )
-        # Pack as [a, b, c=0, alpha=1, d=0] for _find_envelope_crossing:
-        # _envelope_model(r, a, b, 0, 1, 0) = a/(π b r)² — the sinc² envelope.
-        return np.array([a_fit, b_fit, 0.0, 1.0, 0.0]), p_pos_sig_s, p_neg_sig_s
+        return np.array(popt), p_pos_sig_s, p_neg_sig_s
     except (RuntimeError, ValueError, TypeError) as e:
-        print(f"sinc² signal fit failed: {e}")
+        print(f"power-law+oscillation signal fit failed: {e}")
         return None, p_pos_sig_s, p_neg_sig_s
 
 
@@ -1013,7 +1093,13 @@ def measure_spike_lengths(
             if converged:
                 arm_results[label] = (r_cross, radii_arm, p_arm_s, True)
             elif popt is not None:
-                r_extrap = _find_envelope_crossing(popt, threshold, float(radii_arm[-1]))
+                if use_bg_sub:
+                    A_f, gamma_f, _f, C_f, _phi = popt
+                    r_extrap = _powerlaw_osc_envelope_crossing(
+                        A_f, gamma_f, C_f, threshold,
+                    )
+                else:
+                    r_extrap = _find_envelope_crossing(popt, threshold, float(radii_arm[-1]))
                 if r_extrap is not None:
                     if r_extrap < float(radii_arm[-1]):
                         r_extrap = float(radii_arm[-1])
