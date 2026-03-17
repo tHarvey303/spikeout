@@ -51,6 +51,7 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
     centre_row = n_rho // 2
     # Use the actual acceptance band stored in the result (includes blank_r
     # for saturated stars) rather than recomputing from max_rho_fraction alone.
+    print('check', result.max_rho_px)
     max_rho_px = result.max_rho_px if result.max_rho_px > 0 \
         else max_rho_fraction * min(image.shape) / 2.0
 

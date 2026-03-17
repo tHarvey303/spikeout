@@ -592,6 +592,7 @@ def measure_spike_lengths(
     max_radius=None,
     median_subtract=False,
     background_profiles=True,
+    max_output_length=5000,
 ):
     """Measure the length of each detected spike arm.
 
@@ -655,7 +656,10 @@ def measure_spike_lengths(
         measuring lengths.  This can help isolate the spike profile from the
         PSF halo, but may not be desirable if the halo is very asymmetric.
     background_profiles : bool
-        If *True*, extract background profiles from random angles for sanity check and potential future use.
+        If *True*, extract background profiles from random angles for 
+        sanity check and potential future use.
+    max_output_length : int
+        Maximum length of each arm allowed.
 
     Returns
     -------
@@ -809,11 +813,20 @@ def measure_spike_lengths(
             elif popt is not None:
                 r_extrap = _find_envelope_crossing(popt, threshold, float(radii_arm[-1]))
                 if r_extrap is not None:
+                    # If fitting fails weirdly but profile crossing is raised, use max radius of the profile as the length and mark as unconverged.  
+                    # This is a fallback for cases where the fit is so bad that the envelope crossing fails, but the profile crossing still gives a reasonable length.
+                    if r_extrap < float(radii_arm[-1]):
+                        r_extrap = float(radii_arm[-1])
                     arm_results[label] = (r_extrap, radii_arm, p_arm_s, False)
                 else:
                     arm_results[label] = (float(radii_arm[-1]), radii_arm, p_arm_s, False)
             else:
                 arm_results[label] = (float(radii_arm[-1]), radii_arm, p_arm_s, False)
+
+        if arm_results["pos"][0] > max_output_length:
+            arm_results["pos"] = (max_output_length, arm_results["pos"][1], arm_results["pos"][2], arm_results["pos"][3])
+        if arm_results["neg"][0] > max_output_length:
+            arm_results["neg"] = (max_output_length, arm_results["neg"][1], arm_results["neg"][2], arm_results["neg"][3])
 
         lengths.append(SpikeLengths(
             angle_deg=angle,
