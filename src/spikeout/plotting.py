@@ -329,5 +329,11 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
                 title=f"Spike @ {sl.angle_deg:.1f}°",
             )
             ax.legend(fontsize=12)
+            # Set ylimit to just below required threshold
+            if sl.threshold > 0:
+                ax.set_ylim(top=ax.get_ylim()[1], bottom=0.8 * sl.threshold)
+            # Set top to highest of maximim arm 
+            max_arm = max(sl.profile_pos.max(), sl.profile_neg.max())
+            ax.set_ylim(top=1.2 * max_arm)
 
     return fig
