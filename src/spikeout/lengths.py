@@ -831,7 +831,7 @@ def measure_spike_lengths(
     max_radius=None,
     median_subtract=False,
     background_profiles=True,
-    max_output_length=5000,
+    max_output_length=None,
     background_subtract=True,
 ):
     """Measure the length of each detected spike arm.
@@ -911,7 +911,7 @@ def measure_spike_lengths(
         If *True* (or when ``background_subtract=True``), extract background
         profiles from random off-spike angles.  Always forced *True* when
         ``background_subtract=True``.
-    max_output_length : int
+    max_output_length : int or *None*
         Maximum length of each arm allowed (pixels).
     background_subtract : bool
         If *True* (default), subtract the median background profile from each
@@ -1109,10 +1109,11 @@ def measure_spike_lengths(
             else:
                 arm_results[label] = (float(radii_arm[-1]), radii_arm, p_arm_s, False)
 
-        if arm_results["pos"][0] > max_output_length:
-            arm_results["pos"] = (max_output_length, *arm_results["pos"][1:])
-        if arm_results["neg"][0] > max_output_length:
-            arm_results["neg"] = (max_output_length, *arm_results["neg"][1:])
+        if max_output_length is not None:
+            if arm_results["pos"][0] > max_output_length:
+                arm_results["pos"] = (max_output_length, *arm_results["pos"][1:])
+            if arm_results["neg"][0] > max_output_length:
+                arm_results["neg"] = (max_output_length, *arm_results["neg"][1:])
 
         lengths.append(SpikeLengths(
             angle_deg=angle,
