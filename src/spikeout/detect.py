@@ -13,6 +13,7 @@ from skimage.transform import radon
 from .geometry import sinogram_rho_to_physical, radon_line_to_image
 from .preprocess import prepare_image
 from .lengths import SpikeLengths, measure_spike_lengths
+from .refine import refine_spike_lengths
 
 __all__ = ["SpikeResult", "detect"]
 
@@ -133,6 +134,8 @@ def detect(
     measure_lengths=False,
     length_kw=None,
     min_length=None,
+    refine_lengths=False,
+    refine_kw=None,
     # ── preprocessing ──
     **prep_kw,
 ):
@@ -207,6 +210,17 @@ def detect(
         Minimum total spike length in pixels.  Spikes shorter than this
         are dropped after arm measurement.  Requires
         ``measure_lengths=True``; a warning is issued if set otherwise.
+
+    refine_lengths : bool
+        If *True*, apply :func:`~spikeout.refine.refine_spike_lengths` after
+        the Stage-1 fit.  Requires ``measure_lengths=True``.  The image is
+        probed directly at oscillation peak positions to bracket and then
+        binary-search for the true endpoint.
+
+    refine_kw : dict or *None*
+        Extra keyword arguments forwarded to
+        :func:`~spikeout.refine.refine_spike_lengths`
+        (e.g. ``n_bracket_peaks``, ``n_binary_steps``).
 
     **prep_kw
         Extra keyword arguments forwarded to
@@ -352,9 +366,21 @@ def detect(
             stacklevel=2,
         )
 
+    if refine_lengths and not measure_lengths:
+        warnings.warn(
+            "refine_lengths has no effect when measure_lengths=False",
+            UserWarning,
+            stacklevel=2,
+        )
+
     if measure_lengths and len(peaks_1d) > 0:
         kw = length_kw or {}
         result.lengths = measure_spike_lengths(image, result, **kw)
+
+        if refine_lengths and result.lengths:
+            result.lengths = refine_spike_lengths(
+                result, image, **(refine_kw or {})
+            )
 
         if min_length is not None:
             keep = np.array(

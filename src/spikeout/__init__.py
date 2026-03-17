@@ -2,6 +2,7 @@
 
 from .detect import detect, SpikeResult
 from .lengths import measure_spike_lengths, SpikeLengths
+from .refine import refine_spike_lengths
 from .preprocess import prepare_image, azimuthal_median, find_centre
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .plotting import plot_diagnostics
@@ -16,6 +17,7 @@ __all__ = [
     # lengths
     "measure_spike_lengths",
     "SpikeLengths",
+    "refine_spike_lengths",
     # preprocessing
     "prepare_image",
     "azimuthal_median",

@@ -71,6 +71,21 @@ class SpikeLengths:
     background_profile: Optional[Tuple[np.ndarray, np.ndarray]] = None
     swath_width: float = 0.0
     background_subtracted: bool = False
+    # ── Refinement fields (populated by refine_spike_lengths) ─────────────
+    length_pos_lo: float = 0.0
+    """Last radius at which the positive arm was directly confirmed (px)."""
+    length_neg_lo: float = 0.0
+    """Last radius at which the negative arm was directly confirmed (px)."""
+    length_pos_bracket: float = 0.0
+    """Half-width of the positive-arm endpoint bracket (px uncertainty)."""
+    length_neg_bracket: float = 0.0
+    """Half-width of the negative-arm endpoint bracket (px uncertainty)."""
+    n_probes_pos: int = 0
+    """Number of direct image samples taken for the positive arm."""
+    n_probes_neg: int = 0
+    """Number of direct image samples taken for the negative arm."""
+    refined: bool = False
+    """True if refine_spike_lengths has been applied to this measurement."""
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

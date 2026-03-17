@@ -8,6 +8,7 @@ import warnings
 
 
 from .detect import detect, SpikeResult
+from .refine import refine_spike_lengths
 from .regions import halo_mask as _halo_mask
 
 __all__ = ["CatalogueEntry", "catalogue_detect", "catalogue_summary", "plot_catalogue"]
@@ -66,6 +67,8 @@ def catalogue_detect(
     hdu_index=0,
     n_jobs=1,
     halo_mask_kw=None,
+    refine_lengths=False,
+    refine_kw=None,
     **detect_kw,
 ) -> List[CatalogueEntry]:
     """Run spike detection on a list of sky positions in a FITS image.
@@ -95,6 +98,14 @@ def catalogue_detect(
         ``CatalogueEntry.halo_mask`` / ``CatalogueEntry.halo_radius``.
         Pass an empty dict ``{}`` to use all defaults.  *None* (default)
         skips halo masking entirely.
+    refine_lengths : bool
+        If *True*, apply :func:`~spikeout.refine.refine_spike_lengths` to
+        each entry after detection.  Requires ``measure_lengths=True`` in
+        *detect_kw*.  The in-memory cutout is used for probing so no
+        additional FITS I/O is needed.
+    refine_kw : dict or *None*
+        Extra keyword arguments forwarded to
+        :func:`~spikeout.refine.refine_spike_lengths`.
     **detect_kw
         Forwarded to `~spikeout.detect.detect`.
 
@@ -161,6 +172,7 @@ def catalogue_detect(
 
     # ── Phase 2: run detect (optionally parallel) ─────────────────────────
     entries = []
+    _refine_kw = refine_kw or {}
 
     def _run_one(cutout_data):
         """Run detect (and optionally halo_mask) on one cutout."""
@@ -170,6 +182,17 @@ def catalogue_detect(
         else:
             hmask, hradius = None, None
         return result, hmask, hradius
+
+    def _maybe_refine(result, cutout_data):
+        """Apply Stage-2/3 refinement to a detection result if requested."""
+        if (refine_lengths
+                and result is not None
+                and result.lengths is not None
+                and len(result.lengths) > 0):
+            result.lengths = refine_spike_lengths(
+                result, cutout_data, **_refine_kw
+            )
+        return result
 
     if n_jobs == 1:
         for ra, dec, cutout_data, cutout_wcs, error in tqdm(
@@ -182,6 +205,7 @@ def catalogue_detect(
             else:
                 try:
                     result, hmask, hradius = _run_one(cutout_data)
+                    result = _maybe_refine(result, cutout_data)
                     entries.append(CatalogueEntry(
                         ra=ra, dec=dec, cutout=cutout_data,
                         result=result, wcs=cutout_wcs,
@@ -217,6 +241,7 @@ def catalogue_detect(
             else:
                 try:
                     result, hmask, hradius = future.result()
+                    result = _maybe_refine(result, cd)
                     entries.append(CatalogueEntry(
                         ra=ra, dec=dec, cutout=cd,
                         result=result, wcs=cwcs,
