@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, Optional, List, Tuple
 from scipy.ndimage import median_filter
 
-from .stats import mad_std
+from .stats import mad_std, estimate_background
 from .preprocess import find_centre
 
 __all__ = ["SpikeLengths", "measure_spike_lengths"]
@@ -307,115 +307,6 @@ def _max_length_in_array(row_start, col_start, angle_deg, nrow, ncol, step=1.0):
 
 
 # ---------------------------------------------------------------------------
-# Background estimation
-# ---------------------------------------------------------------------------
-
-def _estimate_background(img, cy, cx, blank_r):
-    """Estimate background level and RMS, masking the stellar halo and
-    neighbouring sources.
-
-    Tries to use ``sep`` (Source Extractor Python) for robust estimation with
-    a segmentation-based source mask.  Falls back to pixel-to-pixel
-    differences if ``sep`` is not installed.
-
-    Parameters
-    ----------
-    img : 2-D array
-        Image to analyse (NaN-safe).
-    cy, cx : float
-        Centre of the star.
-    blank_r : float
-        Blank radius used by the detector (innermost exclusion zone, pixels).
-
-    Returns
-    -------
-    bg_level : float
-    sigma_bg : float
-    """
-    ny, nx = img.shape
-    Y_g, X_g = np.ogrid[:ny, :nx]
-    R = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
-
-    # Generous halo exclusion: at least blank_r + 20% of the half-image size
-    halo_r = max(blank_r + 5, 0.20 * min(ny, nx))
-
-    try:
-        import sep
-
-        work = np.ascontiguousarray(img, dtype=np.float64)
-        nan_mask = ~np.isfinite(work)
-        work[nan_mask] = 0.0
-
-        # Inner halo mask: pixels too close to the star are always masked
-        halo_mask = (R < halo_r).astype(np.uint8)
-        halo_mask[nan_mask] = 1
-
-        # Run sep background estimation on the halo-masked image
-        try:
-            bkg = sep.Background(work, mask=halo_mask, bw=64, bh=64,
-                                 fw=3, fh=3)
-        except Exception:
-            bkg = sep.Background(work, mask=halo_mask)
-
-        bkg_img = bkg.back()
-        rms_img = bkg.rms()
-
-        # Residual image for source detection (suppress halo area)
-        residual = work - bkg_img
-        residual[halo_mask.astype(bool)] = 0.0
-
-        # Detect neighbouring sources and build segmentation mask
-        try:
-            _, seg = sep.extract(residual, thresh=3.0, err=rms_img,
-                                 segmentation_map=True)
-            source_mask = seg > 0
-        except Exception:
-            source_mask = np.zeros(img.shape, dtype=bool)
-
-        # Combined mask: halo + NaN + neighbouring sources
-        full_mask = halo_mask.astype(bool) | source_mask | nan_mask
-
-        # Outer annulus for reference (avoid the very centre)
-        outer = R > halo_r
-
-        good = outer & ~full_mask
-        if good.sum() >= 20:
-            bg_level = float(np.median(bkg_img[good]))
-            sigma_bg = float(np.median(rms_img[good]))
-        else:
-            # Very crowded field: use global sep background/rms
-            bg_level = float(bkg.globalback)
-            sigma_bg = float(bkg.globalrms)
-
-        return bg_level, max(sigma_bg, 1e-10)
-
-    except ImportError:
-        pass
-
-    # ── Fallback: pixel-to-pixel difference estimator ─────────────────────
-    r_noise_annulus = max(halo_r, 0.75 * min(ny, nx) / 2.0)
-
-    dx_diff = np.diff(img, axis=1)
-    dy_diff = np.diff(img, axis=0)
-    noise_dx = dx_diff[R[:, :-1] > r_noise_annulus]
-    noise_dy = dy_diff[R[:-1, :] > r_noise_annulus]
-    noise_all = np.concatenate([noise_dx, noise_dy])
-    noise_all = noise_all[np.isfinite(noise_all)]
-
-    if noise_all.size >= 20:
-        sigma_bg = float(mad_std(noise_all)) / np.sqrt(2)
-    else:
-        sigma_bg = float(mad_std(img[np.isfinite(img)]))
-
-    outer_px = img[R > r_noise_annulus]
-    outer_px = outer_px[np.isfinite(outer_px)]
-    bg_level = float(np.median(outer_px)) if outer_px.size >= 10 \
-        else float(np.median(img[np.isfinite(img)]))
-
-    return bg_level, max(sigma_bg, 1e-10)
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -554,7 +445,9 @@ def measure_spike_lengths(
     Y_g, X_g = np.ogrid[:ny, :nx]
     R_from_centre = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
 
-    bg_level, sigma_bg = _estimate_background(img, cy, cx, blank_r)
+    # Inner exclusion: generous halo radius (blank_r + 20% of half-image)
+    halo_inner_r = max(blank_r + 5, 0.20 * min(ny, nx))
+    bg_level, sigma_bg = estimate_background(img, cy, cx, halo_inner_r)
     threshold = bg_level + length_sigma * sigma_bg
 
     theta = result.theta

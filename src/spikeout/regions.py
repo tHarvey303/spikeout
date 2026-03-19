@@ -1,7 +1,7 @@
 """DS9 region file generation and pixel masks for diffraction spikes and halos."""
 
 import numpy as np
-from .stats import mad_std
+from .stats import mad_std, estimate_background
 
 __all__ = [
     "spike_box_regions",
@@ -420,13 +420,10 @@ def halo_mask(
     max_radius = max(max_radius, min_radius + 1.0)
 
     # ── Background estimation ─────────────────────────────────────────────
-    # Outer annulus; MAD is robust to any remaining halo or neighbour flux.
+    # Use sep-based estimator (masks halo + neighbouring sources) when
+    # available; falls back to pixel-to-pixel MAD otherwise.
     bg_inner = background_min_r_frac * max_radius
-    bg_px = img[(R >= bg_inner) & (R < max_radius) & np.isfinite(img)]
-    if bg_px.size < 20:
-        bg_px = img[np.isfinite(img)]   # fallback for very small images
-    bg_level = float(np.median(bg_px))
-    bg_sigma = float(mad_std(bg_px))
+    bg_level, bg_sigma = estimate_background(img, cy, cx, bg_inner)
     threshold = bg_level + threshold_nsigma * bg_sigma
 
     # ── Azimuthal-median radial profile ───────────────────────────────────
