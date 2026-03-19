@@ -23,9 +23,12 @@ def find_centre(image):
     centre : (float, float)
         ``(row, col)`` of the detected centre.
     """
-    smooth = uniform_filter(np.nan_to_num(image, nan=0.0), size=5)
-    peak_idx = np.unravel_index(np.argmax(smooth), smooth.shape)
-    return (float(peak_idx[0]), float(peak_idx[1]))
+    #smooth = uniform_filter(np.nan_to_num(image, nan=0.0), size=5)
+    #peak_idx = np.unravel_index(np.argmax(smooth), smooth.shape)
+    #return (float(peak_idx[0]), float(peak_idx[1]))
+    # Just use the image centre for now since the star is usually well centred in the cutout.
+    ny, nx = image.shape
+    return (float(ny) / 2.0, float(nx) / 2.0)
 
 
 def azimuthal_median(image, centre=None, radial_bin_width=1):

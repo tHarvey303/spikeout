@@ -66,7 +66,6 @@ def catalogue_detect(
     hdu_index=0,
     n_jobs=1,
     halo_mask_kw=None,
-    full_array=None,
     measure_lengths=False,
     length_kw=None,
     **detect_kw,
@@ -98,12 +97,6 @@ def catalogue_detect(
         ``CatalogueEntry.halo_mask`` / ``CatalogueEntry.halo_radius``.
         Pass an empty dict ``{}`` to use all defaults.  *None* (default)
         skips halo masking entirely.
-    full_array : 2-D array or *None*
-        Pre-opened memory-mapped full image array (e.g. ``hdul[0].data``
-        with ``memmap=True``).  When provided together with
-        ``measure_lengths=True``, spike arms that extend beyond the
-        cutout are measured against the full image, so the reported
-        lengths are not clipped at the cutout boundary.
     measure_lengths : bool
         If *True*, measure spike arm lengths after detection.  When
         ``full_array`` is given the two-stage extraction is used (cutout
@@ -183,6 +176,7 @@ def catalogue_detect(
                     None, None, None, None, str(exc),
                 ))
 
+    full_array = fits.getdata(image_path, hdu_index, memmap=True) if measure_lengths else None
     # ── Phase 2: run detect (optionally parallel) ─────────────────────────
     entries = []
     _lkw = length_kw or {}
@@ -441,6 +435,28 @@ def plot_catalogue(
                         transform=ax.transAxes,
                         fontsize=6, color=colors[i], va='top',
                     '''
+                
+                # If we have length measurements, plot the end of the arm as well
+                if res.lengths is not None:
+                    for i in range(len(res.angles)):
+                        length = res.lengths[i].length_total
+                        if np.isfinite(length) and length > 0:
+                            rho = res.rho_physical[i]
+                            th = res.theta[res.peak_theta_indices[i]]
+                            (x1, y1), (x2, y2), angle = radon_line_to_image(
+                                rho, th, entry.cutout.shape,
+                            )
+                            # Compute unit vector along the line
+                            dx = x2 - x1
+                            dy = y2 - y1
+                            norm = np.hypot(dx, dy)
+                            if norm > 0:
+                                ux, uy = dx / norm, dy / norm
+                                # Extend the line by the measured length
+                                x_end = x2 + ux * length
+                                y_end = y2 + uy * length
+                                ax.plot([x2, x_end], [y2, y_end],
+                                        color='red', lw=1.0, alpha=0.85)
             elif res is not None:
                 ax.text(
                     0.5, 0.02, 'no spikes',

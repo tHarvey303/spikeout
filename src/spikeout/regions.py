@@ -283,7 +283,7 @@ def write_catalogue_ds9_regions(
     for entry in entries:
         if entry.result is None or entry.result.lengths is None:
             print(f"Warning: entry {entry} has result.lengths = None; skipping")
-            if entry.result is not None and entry.lengths is None:
+            if entry.result is not None and entry.result.lengths is None:
                 print(f"Warning: entry {entry} has result.lengths = None; skipping")
             
             continue

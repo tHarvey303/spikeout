@@ -93,6 +93,26 @@ def estimate_background(img, cy, cx, inner_r):
         outer = R >= inner_r
         good = outer & ~full_mask
 
+        # Dilate the mask to ensure we exclude all halo and source pixels, even if the segmentation is imperfect.  This is a simple morphological dilation using a disk structuring element.
+        from scipy.ndimage import binary_dilation
+        dilate_radius = 10  # pixels
+        struct = np.zeros((2 * dilate_radius + 1, 2 * dilate_radius + 1), dtype=bool)
+        y, x = np.ogrid[-dilate_radius:dilate_radius + 1, -dilate_radius:dilate_radius + 1]
+        struct[x**2 + y**2 <= dilate_radius**2] = True
+        full_mask = binary_dilation(full_mask, structure=struct)
+        '''
+        # Diagnostic plot showing the pixels used
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6, 6))
+        plt.imshow(full_mask, origin='lower', cmap='gray_r')
+        plt.title('Masked pixels (white = masked)')
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.scatter(cx, cy, color='red', marker='x', label='Star centre')
+        plt.legend()
+        plt.show()
+        '''
+
         if good.sum() >= 20:
             bg_level = float(np.median(bkg_img[good]))
             sigma_bg = float(np.median(rms_img[good]))

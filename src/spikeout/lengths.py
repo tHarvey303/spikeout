@@ -315,6 +315,7 @@ def measure_spike_lengths(
     result,
     swath_width=None,
     length_sigma=2.0,
+    override_threshold=None,
     centre=None,
     full_array=None,
     centre_row_full=None,
@@ -356,6 +357,10 @@ def measure_spike_lengths(
         Default: ``max(3, min(image.shape) * 0.02)``.
     length_sigma : float
         Threshold multiplier: ``background + length_sigma × σ_sky``.
+        Does not apply if ``override_threshold`` is provided.
+    override_threshold : float or None
+        If provided, use this absolute threshold instead of the estimated
+        background + length_sigma × σ_sky.
     centre : (row, col) or None
         Star centre in the cutout.  Auto-detected if None.
     full_array : 2-D array or None
@@ -414,12 +419,15 @@ def measure_spike_lengths(
             centre_col_full = float(px)
             centre_row_full = float(py)
 
+    print(f'col: {centre_col_full}, row: {centre_row_full}')
+
     # ── blank-core radius (saturated / NaN core) ──────────────────────────
     if centre is None:
         centre = find_centre(image)
     cy, cx = centre
     blank_r = _blank_core_radius(image, centre=centre) + 3.0
-
+    print(f'Blank-core radius: {blank_r:.1f} pixels')
+    print(f'Cutout centre: ({cx:.1f}, {cy:.1f})')
     # ── working copy (NaN → 0 for safe indexing) ──────────────────────────
     img = image.copy()
     img[~np.isfinite(img)] = 0.0
@@ -447,8 +455,15 @@ def measure_spike_lengths(
 
     # Inner exclusion: generous halo radius (blank_r + 20% of half-image)
     halo_inner_r = max(blank_r + 5, 0.20 * min(ny, nx))
-    bg_level, sigma_bg = estimate_background(img, cy, cx, halo_inner_r)
-    threshold = bg_level + length_sigma * sigma_bg
+    if override_threshold is not None:
+        threshold = override_threshold
+        bg_level = np.nan
+        sigma_bg = np.nan
+    else:
+        bg_level, sigma_bg = estimate_background(img, cy, cx, halo_inner_r)
+        threshold = bg_level + length_sigma * sigma_bg
+
+    print(f'Threshold: {threshold:.4f} (bg {bg_level:.4f} + {length_sigma} × σ {sigma_bg:.4f})')
 
     theta = result.theta
     pk_th = result.peak_theta_indices
@@ -573,6 +588,11 @@ def measure_spike_lengths(
                         length_px, radii_full, profile_full_smooth, converged,
                     )
                     continue
+            elif at_cutout_edge and full_array is None:
+                print(
+                    f"Warning: spike arm at angle {angle:.1f}° reached cutout edge "
+                    "and no full_array provided; length may be underestimated."
+                )
 
             # ── Step 1 result ─────────────────────────────────────────────
             converged = not at_cutout_edge
