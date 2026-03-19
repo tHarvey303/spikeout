@@ -7,7 +7,6 @@ from .stats import mad_std
 from .detect import detect
 from .geometry import radon_line_to_image, sinogram_rho_to_physical
 from .preprocess import azimuthal_median
-from .lengths import _fraunhofer_model, _envelope_model
 
 __all__ = ["plot_diagnostics"]
 
@@ -249,27 +248,6 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
                 r_bg, p_bg = result.lengths[i].background_profile
                 ax.semilogy(r_bg, np.maximum(p_bg, 1e-30), ":", color="green",
                             lw=1.0, alpha=0.7, label="Background profile")
-
-            # Fraunhofer fit + envelope
-            if sl.popt is not None:
-                r_all = np.concatenate([sl.radii_pos, sl.radii_neg])
-                r_dense = np.linspace(max(r_all.min(), 0.5), r_all.max(), 400)
-                fit_vals = _fraunhofer_model(r_dense, *sl.popt)
-                env_vals = _envelope_model(r_dense, *sl.popt)
-                ax.semilogy(r_dense, np.maximum(fit_vals, 1e-30),
-                            "-", color="0.35", lw=1.0, alpha=0.7,
-                            label="Fraunhofer fit")
-                ax.semilogy(r_dense, np.maximum(env_vals, 1e-30),
-                            ":", color="0.35", lw=1.0, alpha=0.7,
-                            label="Envelope")
-
-                # Plot core component of the fit as a separate dashed line to show how much of the profile is explained by the core vs. the envelope.
-                # is c / r ** alpha + d
-                # full components are r, a, b, c, alpha, d
-                core_vals = sl.popt[2] / r_dense ** sl.popt[3] + sl.popt[4]
-                ax.semilogy(r_dense, np.maximum(core_vals, 1e-30),
-                            "--", color="0.35", lw=1.0, alpha=0.7,
-                            label="Core")
 
             # Detection threshold
             if sl.threshold > 0:

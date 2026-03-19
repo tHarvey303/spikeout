@@ -66,6 +66,9 @@ def catalogue_detect(
     hdu_index=0,
     n_jobs=1,
     halo_mask_kw=None,
+    full_array=None,
+    measure_lengths=False,
+    length_kw=None,
     **detect_kw,
 ) -> List[CatalogueEntry]:
     """Run spike detection on a list of sky positions in a FITS image.
@@ -95,6 +98,20 @@ def catalogue_detect(
         ``CatalogueEntry.halo_mask`` / ``CatalogueEntry.halo_radius``.
         Pass an empty dict ``{}`` to use all defaults.  *None* (default)
         skips halo masking entirely.
+    full_array : 2-D array or *None*
+        Pre-opened memory-mapped full image array (e.g. ``hdul[0].data``
+        with ``memmap=True``).  When provided together with
+        ``measure_lengths=True``, spike arms that extend beyond the
+        cutout are measured against the full image, so the reported
+        lengths are not clipped at the cutout boundary.
+    measure_lengths : bool
+        If *True*, measure spike arm lengths after detection.  When
+        ``full_array`` is given the two-stage extraction is used (cutout
+        first, then full image for unconstrained arms).  Lengths are
+        stored in ``entry.result.lengths``.
+    length_kw : dict or *None*
+        Extra keyword arguments forwarded to
+        `~spikeout.lengths.measure_spike_lengths`.
     **detect_kw
         Forwarded to `~spikeout.detect.detect`.
 
@@ -135,8 +152,11 @@ def catalogue_detect(
         else [(cutout_size, cutout_size)] * len(coords)
     )
 
+    from .lengths import measure_spike_lengths as _measure_spike_lengths
+
     # ── Phase 1: extract cutouts (sequential, file must stay open) ────────
-    raw = []  # (ra, dec, cutout_data_or_None, cutout_wcs_or_None, error_or_None)
+    # raw items: (ra, dec, cutout_data, cutout_wcs, px_col, px_row, error)
+    raw = []
     with fits.open(image_path, memmap=True) as hdul:
         hdu = hdul[hdu_index]
         image_wcs = WCS(hdu.header)
@@ -144,6 +164,8 @@ def catalogue_detect(
 
         for sky, size in zip(coords, sizes):
             try:
+                # pixel position of source in the full array
+                px, py = image_wcs.world_to_pixel(sky)
                 co = Cutout2D(
                     data, sky, size, wcs=image_wcs,
                     mode='partial', fill_value=np.nan,
@@ -151,16 +173,19 @@ def catalogue_detect(
                 )
                 raw.append((
                     float(sky.ra.deg), float(sky.dec.deg),
-                    co.data.astype(float), co.wcs, None,
+                    co.data.astype(float), co.wcs,
+                    float(px), float(py),  # full-array col, row
+                    None,
                 ))
             except Exception as exc:
                 raw.append((
                     float(sky.ra.deg), float(sky.dec.deg),
-                    None, None, str(exc),
+                    None, None, None, None, str(exc),
                 ))
 
     # ── Phase 2: run detect (optionally parallel) ─────────────────────────
     entries = []
+    _lkw = length_kw or {}
 
     def _run_one(cutout_data):
         """Run detect (and optionally halo_mask) on one cutout."""
@@ -171,8 +196,19 @@ def catalogue_detect(
             hmask, hradius = None, None
         return result, hmask, hradius
 
+    def _apply_lengths(cutout_data, result, px_col, px_row):
+        """Measure spike lengths, using full_array if provided."""
+        if result is None or len(result.angles) == 0:
+            return
+        kw = dict(_lkw)
+        if full_array is not None and px_col is not None:
+            kw.setdefault('full_array', full_array)
+            kw.setdefault('centre_col_full', px_col)
+            kw.setdefault('centre_row_full', px_row)
+        result.lengths = _measure_spike_lengths(cutout_data, result, **kw)
+
     if n_jobs == 1:
-        for ra, dec, cutout_data, cutout_wcs, error in tqdm(
+        for ra, dec, cutout_data, cutout_wcs, px_col, px_row, error in tqdm(
             raw, desc="Detecting spikes"
         ):
             if error is not None:
@@ -182,6 +218,8 @@ def catalogue_detect(
             else:
                 try:
                     result, hmask, hradius = _run_one(cutout_data)
+                    if measure_lengths:
+                        _apply_lengths(cutout_data, result, px_col, px_row)
                     entries.append(CatalogueEntry(
                         ra=ra, dec=dec, cutout=cutout_data,
                         result=result, wcs=cutout_wcs,
@@ -199,10 +237,10 @@ def catalogue_detect(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(_run_one, cd) if error is None else None
-                for _, _, cd, _, error in raw
+                for _, _, cd, _, _, _, error in raw
             ]
 
-        for (ra, dec, cd, cwcs, error), future in tqdm(
+        for (ra, dec, cd, cwcs, px_col, px_row, error), future in tqdm(
             zip(raw, futures), total=len(raw), desc="Detecting spikes"
         ):
             if error is not None:
@@ -217,6 +255,8 @@ def catalogue_detect(
             else:
                 try:
                     result, hmask, hradius = future.result()
+                    if measure_lengths:
+                        _apply_lengths(cd, result, px_col, px_row)
                     entries.append(CatalogueEntry(
                         ra=ra, dec=dec, cutout=cd,
                         result=result, wcs=cwcs,
