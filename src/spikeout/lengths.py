@@ -419,15 +419,15 @@ def measure_spike_lengths(
             centre_col_full = float(px)
             centre_row_full = float(py)
 
-    print(f'col: {centre_col_full}, row: {centre_row_full}')
+    #print(f'col: {centre_col_full}, row: {centre_row_full}')
 
     # ── blank-core radius (saturated / NaN core) ──────────────────────────
     if centre is None:
         centre = find_centre(image)
     cy, cx = centre
     blank_r = _blank_core_radius(image, centre=centre) + 3.0
-    print(f'Blank-core radius: {blank_r:.1f} pixels')
-    print(f'Cutout centre: ({cx:.1f}, {cy:.1f})')
+    #print(f'Blank-core radius: {blank_r:.1f} pixels')
+    #print(f'Cutout centre: ({cx:.1f}, {cy:.1f})')
     # ── working copy (NaN → 0 for safe indexing) ──────────────────────────
     img = image.copy()
     img[~np.isfinite(img)] = 0.0
@@ -463,7 +463,7 @@ def measure_spike_lengths(
         bg_level, sigma_bg = estimate_background(img, cy, cx, halo_inner_r)
         threshold = bg_level + length_sigma * sigma_bg
 
-    print(f'Threshold: {threshold:.4f} (bg {bg_level:.4f} + {length_sigma} × σ {sigma_bg:.4f})')
+    #print(f'Threshold: {threshold:.4f} (bg {bg_level:.4f} + {length_sigma} × σ {sigma_bg:.4f})')
 
     theta = result.theta
     pk_th = result.peak_theta_indices
