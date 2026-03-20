@@ -496,21 +496,25 @@ def write_spike_mask_fits(
     tile_size=4096,
     n_workers=4,
 ):
-    """Write a full-frame spike mask to a FITS file using tiled processing.
+    """Write a full-frame spike + halo mask to a FITS file using tiled processing.
 
-    Rasterises spike boxes from a list of ``CatalogueEntry`` objects into a
-    ``uint8`` FITS image (1 = masked, 0 = unmasked).  The output file is
-    pre-allocated as a memory-mapped FITS image and tiles are filled in
-    parallel, so peak RAM usage is proportional to tile size rather than the
-    full image.
+    Rasterises spike boxes and stellar halo circles from a list of
+    ``CatalogueEntry`` objects into a ``uint8`` FITS image (1 = masked,
+    0 = unmasked).  The output file is pre-allocated as a memory-mapped FITS
+    image and tiles are filled in parallel, so peak RAM usage is proportional
+    to tile size rather than the full image.
 
-    Requires ``entry.result.lengths`` to be populated for each entry
-    (run `catalogue_detect` with ``measure_lengths=True``).
+    Spike boxes require ``entry.result.lengths`` to be populated
+    (run `catalogue_detect` with ``measure_lengths=True``).  Halo circles are
+    drawn whenever ``entry.halo_radius`` is set (requires ``halo_mask_kw`` to
+    have been passed to `catalogue_detect`).  Either component is silently
+    skipped for entries where the relevant data is absent.
 
     Parameters
     ----------
     entries : list of CatalogueEntry
-        Must have ``.ra``, ``.dec``, and ``.result.lengths`` populated.
+        ``.ra`` and ``.dec`` are required.  ``.result.lengths`` drives spike
+        boxes; ``.halo_radius`` drives halo circles.
     image_path : str or path-like
         Source FITS image — only the header/WCS are read (no pixel data).
     output_path : str or path-like
@@ -540,7 +544,7 @@ def write_spike_mask_fits(
             "Install with: pip install 'spikeout[astropy]'"
         )
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from skimage.draw import polygon as sk_polygon
+    from skimage.draw import polygon as sk_polygon, disk as sk_disk
     try:
         from tqdm import tqdm as _tqdm
     except ImportError:
@@ -553,19 +557,26 @@ def write_spike_mask_fits(
     H = int(header['NAXIS2'])
     W = int(header['NAXIS1'])
 
-    # ── Precompute all spike-box corners in full-image pixel coords ────────
-    # Each box is stored as (corners_col, corners_row, col_min, col_max,
-    # row_min, row_max) — everything in 0-indexed pixel coords.
+    # ── Precompute all spike-box corners and halo circles in full-image
+    #    pixel coords ────────────────────────────────────────────────────────
+    # Boxes: (corners_col, corners_row, col_min, col_max, row_min, row_max)
+    # Halos: (cx, cy, radius)  — bounding box stored separately as circles_bb
     boxes = []
+    circles = []   # (cx_full, cy_full, radius)
     for entry in entries:
         if entry.error is not None:
-            continue
-        if entry.result is None or entry.result.lengths is None:
             continue
 
         sky = _SkyCoord(ra=entry.ra, dec=entry.dec, unit='deg')
         px, py = full_wcs.world_to_pixel(sky)
         cx, cy = float(px), float(py)   # col (x), row (y)
+
+        # Halo circle (independent of lengths being populated)
+        if entry.halo_radius is not None and entry.halo_radius > 0:
+            circles.append((cx, cy, float(entry.halo_radius)))
+
+        if entry.result is None or entry.result.lengths is None:
+            continue
 
         for sl in entry.result.lengths:
             angle_rad = np.deg2rad(sl.angle_deg)
@@ -602,22 +613,25 @@ def write_spike_mask_fits(
 
     # ── Pre-allocate output FITS via memmap ───────────────────────────────
     out_hdu = _fits.PrimaryHDU(data=np.zeros((H, W), dtype=np.uint8))
-    # Carry over the WCS from the source image
     out_hdu.header.update(full_wcs.to_header())
     out_hdu.writeto(output_path, overwrite=True)
     out_fits = _fits.open(output_path, mode='update', memmap=True)
     out_data = out_fits[0].data
 
-    if not boxes:
+    if not boxes and not circles:
         out_fits.flush()
         out_fits.close()
         return
 
-    # Vectorised bounding boxes for fast per-tile intersection test
+    # Vectorised bounding boxes for fast per-tile intersection tests
     bb = np.array([
         (col_min, col_max, row_min, row_max)
         for _, _, col_min, col_max, row_min, row_max in boxes
-    ], dtype=np.float64)   # shape (N, 4)
+    ], dtype=np.float64) if boxes else np.empty((0, 4), dtype=np.float64)
+
+    # Circles stored as (cx, cy, r); bounding box is trivially ±r
+    circ_arr = np.array(circles, dtype=np.float64) \
+        if circles else np.empty((0, 3), dtype=np.float64)
 
     # ── Per-tile worker ───────────────────────────────────────────────────
     def _process_tile(row0, col0):
@@ -626,25 +640,41 @@ def write_spike_mask_fits(
         th = row1 - row0
         tw = col1 - col0
 
-        # Boxes whose bounding box overlaps this tile
-        hit = (
-            (bb[:, 0] < col1) & (bb[:, 1] > col0) &
-            (bb[:, 2] < row1) & (bb[:, 3] > row0)
-        )
-        if not hit.any():
-            return
-
         tile = np.zeros((th, tw), dtype=np.uint8)
-        for idx in np.nonzero(hit)[0]:
-            # Shift corners to tile-local coordinates
-            local_cols = boxes[idx][0] - col0
-            local_rows = boxes[idx][1] - row0
-            # sk_polygon clips automatically to shape
-            rr, cc = sk_polygon(local_rows, local_cols, shape=(th, tw))
-            tile[rr, cc] = 1
+        any_hit = False
 
-        # Tiles never overlap → direct write, no race condition
-        out_data[row0:row1, col0:col1] |= tile
+        # Spike boxes
+        if bb.shape[0]:
+            hit = (
+                (bb[:, 0] < col1) & (bb[:, 1] > col0) &
+                (bb[:, 2] < row1) & (bb[:, 3] > row0)
+            )
+            for idx in np.nonzero(hit)[0]:
+                local_cols = boxes[idx][0] - col0
+                local_rows = boxes[idx][1] - row0
+                rr, cc = sk_polygon(local_rows, local_cols, shape=(th, tw))
+                tile[rr, cc] = 1
+                any_hit = True
+
+        # Halo circles
+        if circ_arr.shape[0]:
+            cx_arr, cy_arr, r_arr = circ_arr[:, 0], circ_arr[:, 1], circ_arr[:, 2]
+            hit_c = (
+                (cx_arr + r_arr > col0) & (cx_arr - r_arr < col1) &
+                (cy_arr + r_arr > row0) & (cy_arr - r_arr < row1)
+            )
+            for idx in np.nonzero(hit_c)[0]:
+                # sk_disk centre is (row, col)
+                rr, cc = sk_disk(
+                    (cy_arr[idx] - row0, cx_arr[idx] - col0),
+                    r_arr[idx],
+                    shape=(th, tw),
+                )
+                tile[rr, cc] = 1
+                any_hit = True
+
+        if any_hit:
+            out_data[row0:row1, col0:col1] |= tile
 
     # ── Parallel tile loop ────────────────────────────────────────────────
     tiles = [
