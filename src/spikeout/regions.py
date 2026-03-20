@@ -340,11 +340,13 @@ def halo_mask(
     image,
     centre=None,
     threshold_nsigma=3.0,
-    background_min_r_frac=0.6,
+    background_min_r_frac=0.8,
     min_radius=5.0,
     max_radius=None,
     radial_bin_width=1.0,
     smooth_bins=5,
+    override_threshold=None,
+    radius_factor=1.0,
 ):
     """Boolean circular mask enclosing the stellar halo.
 
@@ -374,7 +376,7 @@ def halo_mask(
         Inner radius of the background annulus as a fraction of
         *max_radius*.  Pixels at radius ``> background_min_r_frac ×
         max_radius`` are used for background estimation.  Increase if the
-        stellar halo extends to the image edge.  Default 0.6.
+        stellar halo extends to the image edge.  Default 0.8.
     min_radius : float
         Minimum mask radius in pixels.  Prevents the mask from collapsing
         for very faint or unresolved sources.  Default 5.
@@ -388,6 +390,14 @@ def halo_mask(
         radial profile before thresholding.  Suppresses single-bin
         excursions from noise or a neighbour source occupying a small
         fraction of an annulus.  Default 5.
+    override_threshold : float or None
+        If not *None*, use this fixed threshold value instead of estimating
+        from the image.  Useful when the image is too small to get a good
+        background estimate, e.g. a tight cutout around a bright star.
+    radius_factor : float
+        Optional multiplicative factor applied to the measured halo radius.
+        Default 1.0 (no scaling).  Increase to be more conservative in
+        masking the halo, at the cost of masking more pixels.
 
     Returns
     -------
@@ -424,9 +434,14 @@ def halo_mask(
     # ── Background estimation ─────────────────────────────────────────────
     # Use sep-based estimator (masks halo + neighbouring sources) when
     # available; falls back to pixel-to-pixel MAD otherwise.
-    bg_inner = background_min_r_frac * max_radius
-    bg_level, bg_sigma = estimate_background(img, cy, cx, bg_inner)
-    threshold = bg_level + threshold_nsigma * bg_sigma
+
+    if not override_threshold:
+        bg_inner = background_min_r_frac * max_radius
+        bg_level, bg_sigma = estimate_background(img, cy, cx, bg_inner)
+        threshold = bg_level + threshold_nsigma * bg_sigma
+    else:
+        threshold = override_threshold
+        bg_level = 0
 
     # ── Azimuthal-median radial profile ───────────────────────────────────
     # Median per concentric annulus; a single-source neighbour biases the
@@ -465,6 +480,9 @@ def halo_mask(
         if profile_s[i] >= threshold:
             halo_r = max(float(r_centers[i]), min_radius)
 
+    if radius_factor != 1.0:
+        halo_r *= radius_factor
+
     # ── Build circular mask ───────────────────────────────────────────────
     mask = R <= halo_r
     return mask, halo_r
@@ -495,6 +513,7 @@ def write_spike_mask_fits(
     max_width=None,
     tile_size=4096,
     n_workers=4,
+    invert=False,
 ):
     """Write a full-frame spike + halo mask to a FITS file using tiled processing.
 
@@ -528,6 +547,8 @@ def write_spike_mask_fits(
     n_workers : int
         Number of parallel worker threads.  ``1`` runs sequentially.
         ``-1`` uses all available CPU threads.  Default 4.
+    invert : bool
+        If *True*, invert the mask so that 0 = masked and 1 = unmasked.  Default *False*.
 
     Returns
     -------
@@ -672,6 +693,9 @@ def write_spike_mask_fits(
                 )
                 tile[rr, cc] = 1
                 any_hit = True
+
+        if invert:
+            tile = 1 - tile
 
         if any_hit:
             out_data[row0:row1, col0:col1] |= tile
