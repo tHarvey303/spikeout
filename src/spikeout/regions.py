@@ -6,6 +6,8 @@ from .stats import mad_std, estimate_background
 __all__ = [
     "spike_box_regions",
     "spike_mask",
+    "write_spike_mask_fits",
+    "write_border_mask_fits",
     "write_ds9_regions",
     "write_catalogue_ds9_regions",
     "halo_mask",
@@ -481,3 +483,325 @@ def _write_reg_file(path, coordsys, regions, colour):
         fh.write(header)
         for r in regions:
             fh.write(r + "\n")
+
+
+def write_spike_mask_fits(
+    entries,
+    image_path,
+    output_path,
+    hdu_index=0,
+    width_fraction=0.1,
+    min_width=5.0,
+    max_width=None,
+    tile_size=4096,
+    n_workers=4,
+):
+    """Write a full-frame spike mask to a FITS file using tiled processing.
+
+    Rasterises spike boxes from a list of ``CatalogueEntry`` objects into a
+    ``uint8`` FITS image (1 = masked, 0 = unmasked).  The output file is
+    pre-allocated as a memory-mapped FITS image and tiles are filled in
+    parallel, so peak RAM usage is proportional to tile size rather than the
+    full image.
+
+    Requires ``entry.result.lengths`` to be populated for each entry
+    (run `catalogue_detect` with ``measure_lengths=True``).
+
+    Parameters
+    ----------
+    entries : list of CatalogueEntry
+        Must have ``.ra``, ``.dec``, and ``.result.lengths`` populated.
+    image_path : str or path-like
+        Source FITS image — only the header/WCS are read (no pixel data).
+    output_path : str or path-like
+        Destination FITS path.  Overwritten if it already exists.
+    hdu_index : int
+        HDU containing the WCS.  Default 0.
+    width_fraction, min_width, max_width
+        Box width geometry; identical semantics to `spike_box_regions`.
+    tile_size : int
+        Side length of each processing tile in pixels.  Default 4096.
+    n_workers : int
+        Number of parallel worker threads.  ``1`` runs sequentially.
+        ``-1`` uses all available CPU threads.  Default 4.
+
+    Returns
+    -------
+    None
+        The mask is written directly to *output_path*.
+    """
+    try:
+        from astropy.io import fits as _fits
+        from astropy.wcs import WCS as _WCS
+        from astropy.coordinates import SkyCoord as _SkyCoord
+    except ImportError:
+        raise ImportError(
+            "astropy is required for write_spike_mask_fits. "
+            "Install with: pip install 'spikeout[astropy]'"
+        )
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from skimage.draw import polygon as sk_polygon
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kw):
+            return it
+
+    # ── Read WCS and image dimensions from header only ────────────────────
+    header = _fits.getheader(image_path, ext=hdu_index)
+    full_wcs = _WCS(header)
+    H = int(header['NAXIS2'])
+    W = int(header['NAXIS1'])
+
+    # ── Precompute all spike-box corners in full-image pixel coords ────────
+    # Each box is stored as (corners_col, corners_row, col_min, col_max,
+    # row_min, row_max) — everything in 0-indexed pixel coords.
+    boxes = []
+    for entry in entries:
+        if entry.error is not None:
+            continue
+        if entry.result is None or entry.result.lengths is None:
+            continue
+
+        sky = _SkyCoord(ra=entry.ra, dec=entry.dec, unit='deg')
+        px, py = full_wcs.world_to_pixel(sky)
+        cx, cy = float(px), float(py)   # col (x), row (y)
+
+        for sl in entry.result.lengths:
+            angle_rad = np.deg2rad(sl.angle_deg)
+            cos_a = np.cos(angle_rad)
+            sin_a = np.sin(angle_rad)
+
+            offset = (sl.length_pos - sl.length_neg) / 2.0
+            bx = cx + offset * cos_a
+            by = cy + offset * sin_a
+
+            half_len = sl.length_total / 2.0
+            half_wid = _box_width(
+                sl.length_total, width_fraction, min_width, max_width
+            ) / 2.0
+
+            # 4 corners; x = column, y = row
+            cx_box = np.array([
+                bx + half_len * cos_a - half_wid * sin_a,
+                bx + half_len * cos_a + half_wid * sin_a,
+                bx - half_len * cos_a + half_wid * sin_a,
+                bx - half_len * cos_a - half_wid * sin_a,
+            ])
+            cy_box = np.array([
+                by + half_len * sin_a + half_wid * cos_a,
+                by + half_len * sin_a - half_wid * cos_a,
+                by - half_len * sin_a - half_wid * cos_a,
+                by - half_len * sin_a + half_wid * cos_a,
+            ])
+            boxes.append((
+                cx_box, cy_box,
+                cx_box.min(), cx_box.max(),
+                cy_box.min(), cy_box.max(),
+            ))
+
+    # ── Pre-allocate output FITS via memmap ───────────────────────────────
+    out_hdu = _fits.PrimaryHDU(data=np.zeros((H, W), dtype=np.uint8))
+    # Carry over the WCS from the source image
+    out_hdu.header.update(full_wcs.to_header())
+    out_hdu.writeto(output_path, overwrite=True)
+    out_fits = _fits.open(output_path, mode='update', memmap=True)
+    out_data = out_fits[0].data
+
+    if not boxes:
+        out_fits.flush()
+        out_fits.close()
+        return
+
+    # Vectorised bounding boxes for fast per-tile intersection test
+    bb = np.array([
+        (col_min, col_max, row_min, row_max)
+        for _, _, col_min, col_max, row_min, row_max in boxes
+    ], dtype=np.float64)   # shape (N, 4)
+
+    # ── Per-tile worker ───────────────────────────────────────────────────
+    def _process_tile(row0, col0):
+        row1 = min(row0 + tile_size, H)
+        col1 = min(col0 + tile_size, W)
+        th = row1 - row0
+        tw = col1 - col0
+
+        # Boxes whose bounding box overlaps this tile
+        hit = (
+            (bb[:, 0] < col1) & (bb[:, 1] > col0) &
+            (bb[:, 2] < row1) & (bb[:, 3] > row0)
+        )
+        if not hit.any():
+            return
+
+        tile = np.zeros((th, tw), dtype=np.uint8)
+        for idx in np.nonzero(hit)[0]:
+            # Shift corners to tile-local coordinates
+            local_cols = boxes[idx][0] - col0
+            local_rows = boxes[idx][1] - row0
+            # sk_polygon clips automatically to shape
+            rr, cc = sk_polygon(local_rows, local_cols, shape=(th, tw))
+            tile[rr, cc] = 1
+
+        # Tiles never overlap → direct write, no race condition
+        out_data[row0:row1, col0:col1] |= tile
+
+    # ── Parallel tile loop ────────────────────────────────────────────────
+    tiles = [
+        (r, c)
+        for r in range(0, H, tile_size)
+        for c in range(0, W, tile_size)
+    ]
+    max_workers = None if n_workers == -1 else n_workers
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_tile, r, c): (r, c) for r, c in tiles}
+        for fut in _tqdm(
+            as_completed(futures), total=len(futures), desc='Writing spike mask'
+        ):
+            fut.result()   # propagate any worker exception
+
+    out_fits.flush()
+    out_fits.close()
+
+
+def write_border_mask_fits(
+    image_path,
+    output_path,
+    edge_distance_px,
+    hdu_index=0,
+    tile_size=4096,
+    n_workers=4,
+):
+    """Write a border-proximity mask to a FITS file using tiled EDT processing.
+
+    Pixels within *edge_distance_px* pixels of the image border (defined as
+    the outermost extent of valid — non-NaN, non-zero — data) are set to 1.
+    Internal holes such as dead pixels or small NaN regions are filled before
+    border detection so they do not generate spurious interior edge masks.
+
+    The distance is computed via ``scipy.ndimage.distance_transform_edt`` on
+    the border mask.  Each tile is processed with a halo of at least
+    *edge_distance_px* pixels so that EDT results are accurate right up to
+    tile boundaries.
+
+    Parameters
+    ----------
+    image_path : str or path-like
+        Source FITS image (memmap-read; only the validity mask is loaded).
+    output_path : str or path-like
+        Destination FITS path.  Overwritten if it already exists.
+    edge_distance_px : int or float
+        Mask pixels closer than this many pixels to the image border.
+    hdu_index : int
+        HDU containing the image data.  Default 0.
+    tile_size : int
+        Side length of each processing tile in pixels.  Default 4096.
+    n_workers : int
+        Number of parallel worker threads.  ``-1`` uses all available
+        CPU threads.  Default 4.
+
+    Returns
+    -------
+    None
+        The mask is written directly to *output_path*.
+    """
+    try:
+        from astropy.io import fits as _fits
+        from astropy.wcs import WCS as _WCS
+    except ImportError:
+        raise ImportError(
+            "astropy is required for write_border_mask_fits. "
+            "Install with: pip install 'spikeout[astropy]'"
+        )
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from scipy.ndimage import distance_transform_edt, binary_fill_holes
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kw):
+            return it
+
+    edge_px = int(np.ceil(edge_distance_px))
+
+    # ── Read header and memmap image data ─────────────────────────────────
+    header = _fits.getheader(image_path, ext=hdu_index)
+    H = int(header['NAXIS2'])
+    W = int(header['NAXIS1'])
+    full_wcs = _WCS(header)
+
+    image_fits = _fits.open(image_path, memmap=True)
+    image_data = image_fits[hdu_index].data
+
+    # ── Build global border mask (full image, boolean — much smaller than
+    #    the pixel data).  Fills internal holes so dead pixels / small NaN
+    #    regions don't generate spurious interior edge strips.  ────────────
+    print("Building global border mask …")
+    valid = np.isfinite(image_data) & (image_data != 0)
+    # binary_fill_holes requires the full array; result is a compact bool array
+    border_mask = ~binary_fill_holes(valid)   # True = exterior / invalid
+    del valid
+
+    # ── Pre-allocate output FITS ──────────────────────────────────────────
+    out_hdu = _fits.PrimaryHDU(data=np.zeros((H, W), dtype=np.uint8))
+    out_hdu.header.update(full_wcs.to_header())
+    out_hdu.writeto(output_path, overwrite=True)
+    out_fits = _fits.open(output_path, mode='update', memmap=True)
+    out_data = out_fits[0].data
+
+    # ── Per-tile worker ───────────────────────────────────────────────────
+    def _process_tile(row0, col0):
+        row1 = min(row0 + tile_size, H)
+        col1 = min(col0 + tile_size, W)
+        th = row1 - row0
+        tw = col1 - col0
+
+        # Padded slice for EDT context (clamped to image bounds)
+        pr0 = max(row0 - edge_px, 0);  pr1 = min(row1 + edge_px, H)
+        pc0 = max(col0 - edge_px, 0);  pc1 = min(col1 + edge_px, W)
+        r_off = row0 - pr0
+        c_off = col0 - pc0
+
+        chunk_border = border_mask[pr0:pr1, pc0:pc1]
+
+        if not chunk_border.any():
+            # Entirely interior — no border pixels even in the padded region
+            return
+
+        if chunk_border.all():
+            out_data[row0:row1, col0:col1] = 1
+            return
+
+        # EDT: distance from valid data (i.e. from ~chunk_border)
+        dist = distance_transform_edt(~chunk_border)
+        edge_padded = (dist < edge_px).astype(np.uint8)
+
+        # Force mask on true image-boundary strips (pixels right at the array
+        # edge have no exterior context from the padded slice, so EDT cannot
+        # see beyond the image; mark them explicitly).
+        if pr0 == 0: edge_padded[:edge_px, :]  = 1
+        if pr1 == H: edge_padded[-edge_px:, :] = 1
+        if pc0 == 0: edge_padded[:, :edge_px]  = 1
+        if pc1 == W: edge_padded[:, -edge_px:]  = 1
+
+        out_data[row0:row1, col0:col1] = \
+            edge_padded[r_off:r_off + th, c_off:c_off + tw]
+
+    # ── Parallel tile loop ────────────────────────────────────────────────
+    tiles = [
+        (r, c)
+        for r in range(0, H, tile_size)
+        for c in range(0, W, tile_size)
+    ]
+    max_workers = None if n_workers == -1 else n_workers
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_tile, r, c): (r, c) for r, c in tiles}
+        for fut in _tqdm(
+            as_completed(futures), total=len(futures), desc='Writing border mask'
+        ):
+            fut.result()
+
+    out_fits.flush()
+    out_fits.close()
+    image_fits.close()
