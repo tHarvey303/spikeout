@@ -33,7 +33,15 @@ except ImportError:
     mad_std = _mad_std_fallback
 
 
-def estimate_background(img, cy, cx, inner_r):
+# Module-level cached dilation structuring element (10-px disk).
+# Built once at import time rather than rebuilt for every source.
+_DILATE_RADIUS = 10
+_dy, _dx = np.ogrid[-_DILATE_RADIUS:_DILATE_RADIUS + 1,
+                    -_DILATE_RADIUS:_DILATE_RADIUS + 1]
+_DILATE_STRUCT = (_dx ** 2 + _dy ** 2 <= _DILATE_RADIUS ** 2)
+
+
+def estimate_background(img, cy, cx, inner_r, _R=None):
     """Estimate background level and per-pixel RMS, masking the inner region
     (stellar halo) and neighbouring sources.
 
@@ -50,6 +58,9 @@ def estimate_background(img, cy, cx, inner_r):
     inner_r : float
         Inner exclusion radius in pixels — all pixels at r < inner_r
         are treated as halo and excluded from noise estimation.
+    _R : 2-D array or *None*
+        Pre-computed distance array ``sqrt((X-cx)²+(Y-cy)²)``.  Computed
+        internally when *None*.
 
     Returns
     -------
@@ -57,11 +68,15 @@ def estimate_background(img, cy, cx, inner_r):
     sigma_bg : float
     """
     ny, nx = img.shape
-    Y_g, X_g = np.ogrid[:ny, :nx]
-    R = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
+    if _R is None:
+        Y_g, X_g = np.ogrid[:ny, :nx]
+        R = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
+    else:
+        R = _R
 
     try:
         import sep
+        from scipy.ndimage import binary_dilation
 
         work = np.ascontiguousarray(img, dtype=np.float64)
         nan_mask = ~np.isfinite(work)
@@ -90,28 +105,9 @@ def estimate_background(img, cy, cx, inner_r):
             source_mask = np.zeros(img.shape, dtype=bool)
 
         full_mask = halo_mask.astype(bool) | source_mask | nan_mask
+        full_mask = binary_dilation(full_mask, structure=_DILATE_STRUCT)
         outer = R >= inner_r
         good = outer & ~full_mask
-
-        # Dilate the mask to ensure we exclude all halo and source pixels, even if the segmentation is imperfect.  This is a simple morphological dilation using a disk structuring element.
-        from scipy.ndimage import binary_dilation
-        dilate_radius = 10  # pixels
-        struct = np.zeros((2 * dilate_radius + 1, 2 * dilate_radius + 1), dtype=bool)
-        y, x = np.ogrid[-dilate_radius:dilate_radius + 1, -dilate_radius:dilate_radius + 1]
-        struct[x**2 + y**2 <= dilate_radius**2] = True
-        full_mask = binary_dilation(full_mask, structure=struct)
-        '''
-        # Diagnostic plot showing the pixels used
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(6, 6))
-        plt.imshow(full_mask, origin='lower', cmap='gray_r')
-        plt.title('Masked pixels (white = masked)')
-        plt.xlabel('X')
-        plt.ylabel('Y')
-        plt.scatter(cx, cy, color='red', marker='x', label='Star centre')
-        plt.legend()
-        plt.show()
-        '''
 
         if good.sum() >= 20:
             bg_level = float(np.median(bkg_img[good]))

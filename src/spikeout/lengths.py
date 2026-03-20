@@ -118,16 +118,33 @@ def _swath_profile(
     reduce_fn = _get_reducer(reducer)
     profile = np.empty(length, dtype=np.float64)
 
-    for chunk_start in range(0, length, chunk_length):
-        chunk_end = min(chunk_start + chunk_length, length)
+    # For in-memory arrays process the whole profile in one pass to avoid
+    # repeated small-buffer allocations.  For memmaps keep chunking so each
+    # IO read covers a contiguous bounding box.
+    is_memmap = isinstance(data, np.memmap)
+    effective_chunk = chunk_length if is_memmap else length
+
+    offsets = np.arange(-half_w, half_w + 1, dtype=np.float64)
+
+    # Pre-allocate reusable working arrays (max chunk size)
+    max_chunk = min(effective_chunk, length)
+    t_buf      = np.empty(max_chunk, dtype=np.float64)
+    rows_c_buf = np.empty(max_chunk, dtype=np.float64)
+    cols_c_buf = np.empty(max_chunk, dtype=np.float64)
+    vals_buf   = np.empty((max_chunk, len(offsets)), dtype=np.float64)
+
+    for chunk_start in range(0, length, effective_chunk):
+        chunk_end = min(chunk_start + effective_chunk, length)
         n_samples = chunk_end - chunk_start
 
-        t = chunk_start + np.arange(n_samples, dtype=np.float64) * step
+        t = t_buf[:n_samples]
+        np.add(chunk_start, np.arange(n_samples, dtype=np.float64) * step,
+               out=t)
 
-        rows_c = start[0] + t * dr
-        cols_c = start[1] + t * dc
-
-        offsets = np.arange(-half_w, half_w + 1, dtype=np.float64)
+        rows_c = rows_c_buf[:n_samples]
+        cols_c = cols_c_buf[:n_samples]
+        np.add(start[0], t * dr, out=rows_c)
+        np.add(start[1], t * dc, out=cols_c)
 
         rows_all = rows_c[:, None] + offsets[None, :] * pr
         cols_all = cols_c[:, None] + offsets[None, :] * pc
@@ -135,13 +152,10 @@ def _swath_profile(
         ri = np.rint(rows_all).astype(np.intp)
         ci = np.rint(cols_all).astype(np.intp)
 
-        r_min, r_max = int(ri.min()), int(ri.max())
-        c_min, c_max = int(ci.min()), int(ci.max())
-
-        r_min_c = max(r_min, 0)
-        r_max_c = min(r_max, nrow - 1)
-        c_min_c = max(c_min, 0)
-        c_max_c = min(c_max, ncol - 1)
+        r_min_c = max(int(ri.min()), 0)
+        r_max_c = min(int(ri.max()), nrow - 1)
+        c_min_c = max(int(ci.min()), 0)
+        c_max_c = min(int(ci.max()), ncol - 1)
 
         chunk_data = np.asarray(
             data[r_min_c: r_max_c + 1, c_min_c: c_max_c + 1]
@@ -155,7 +169,8 @@ def _swath_profile(
             (ci >= 0) & (ci < ncol)
         )
 
-        vals = np.full(ri.shape, np.nan, dtype=np.float64)
+        vals = vals_buf[:n_samples]
+        vals[:] = np.nan
         vals[valid] = chunk_data[li[valid], lj[valid]]
 
         profile[chunk_start:chunk_end] = reduce_fn(vals)
@@ -237,14 +252,22 @@ def _find_profile_end(
 
     required = max(1, int(W * above_frac))
 
-    last_passing = -1
-    for i in range(n):
-        j = min(i + W, n)
-        count = int(cum[j] - cum[i])
-        if count >= required:
-            last_passing = i
-        else:
-            break
+    # Vectorised: compute all window counts at once, find last passing index
+    # of the leading run (isolated bumps after a gap cannot restart it).
+    n_wins = n - W + 1
+    if n_wins <= 0:
+        counts = np.array([int(cum[n] - cum[0])])
+    else:
+        counts = cum[W: W + n_wins] - cum[:n_wins]
+    passing = counts >= required
+    # Find end of the *leading* contiguous run of passing windows.
+    # np.argmin on the boolean gives the first False; if all True, argmin=0.
+    if not passing[0]:
+        last_passing = -1
+    elif passing.all():
+        last_passing = len(passing) - 1
+    else:
+        last_passing = int(np.argmin(passing)) - 1
 
     if last_passing < 0:
         return 0
@@ -260,7 +283,7 @@ def _find_profile_end(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _blank_core_radius(image, centre=None):
+def _blank_core_radius(image, centre=None, _R=None):
     """Radius of the NaN/zero patch centred on ``centre``."""
     ny, nx = image.shape
     if centre is None:
@@ -273,10 +296,11 @@ def _blank_core_radius(image, centre=None):
     blank = ~np.isfinite(image) | (image == 0.0)
     if not blank[cy_i, cx_i]:
         return 0.0
-    Y, X = np.ogrid[:ny, :nx]
-    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-    nearby = blank & (dist <= min(ny, nx) / 4.0)
-    return float(dist[nearby].max()) if nearby.any() else 0.0
+    if _R is None:
+        Y, X = np.ogrid[:ny, :nx]
+        _R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    nearby = blank & (_R <= min(ny, nx) / 4.0)
+    return float(_R[nearby].max()) if nearby.any() else 0.0
 
 
 def _arm_start(cx, cy, angle_deg, offset_px):
@@ -334,6 +358,7 @@ def measure_spike_lengths(
     above_frac=0.25,
     pad_frac=0.5,
     radial_bin_width=2,
+    low_memory=False,
 ):
     """Measure the length of each detected spike arm via swath profiles.
 
@@ -425,7 +450,12 @@ def measure_spike_lengths(
     if centre is None:
         centre = find_centre(image)
     cy, cx = centre
-    blank_r = _blank_core_radius(image, centre=centre) + 3.0
+    # Pre-compute R once; reused for background estimation below.
+    ny_pre, nx_pre = image.shape
+    Y_pre, X_pre = np.ogrid[:ny_pre, :nx_pre]
+    R_centre_pre = np.sqrt((X_pre - cx) ** 2 + (Y_pre - cy) ** 2)
+    blank_r = _blank_core_radius(image, centre=centre,
+                                 _R=R_centre_pre) + 3.0
     #print(f'Blank-core radius: {blank_r:.1f} pixels')
     #print(f'Cutout centre: ({cx:.1f}, {cy:.1f})')
     # ── working copy (NaN → 0 for safe indexing) ──────────────────────────
@@ -450,8 +480,8 @@ def measure_spike_lengths(
         max_radius = float(np.hypot(ny, nx))
 
     # ── Background noise (sep-based when available, fallback otherwise) ───
-    Y_g, X_g = np.ogrid[:ny, :nx]
-    R_from_centre = np.sqrt((X_g - cx) ** 2 + (Y_g - cy) ** 2)
+    # Reuse the distance array already computed for blank_r (same shape/centre).
+    R_from_centre = R_centre_pre
 
     # Inner exclusion: generous halo radius (blank_r + 20% of half-image)
     halo_inner_r = max(blank_r + 5, 0.20 * min(ny, nx))
@@ -460,7 +490,9 @@ def measure_spike_lengths(
         bg_level = np.nan
         sigma_bg = np.nan
     else:
-        bg_level, sigma_bg = estimate_background(img, cy, cx, halo_inner_r)
+        bg_level, sigma_bg = estimate_background(
+            img, cy, cx, halo_inner_r, _R=R_from_centre,
+        )
         threshold = bg_level + length_sigma * sigma_bg
 
     #print(f'Threshold: {threshold:.4f} (bg {bg_level:.4f} + {length_sigma} × σ {sigma_bg:.4f})')
@@ -470,7 +502,7 @@ def measure_spike_lengths(
 
     # ── optional background profiles ──────────────────────────────────────
     bg_profile_result = None
-    if background_profiles and len(result.angles) > 0:
+    if background_profiles and len(result.angles) > 0 and not low_memory:
         bg_profs = []
         rng = np.random.default_rng(0)
         random_angles = rng.uniform(0, 360, size=80)
@@ -600,20 +632,21 @@ def measure_spike_lengths(
             length_px = min(length_px, float(max_output_length))
             arm_results[label] = (length_px, radii, profile_smooth, converged)
 
+        _empty = np.array([], dtype=np.float64)
         lengths.append(SpikeLengths(
             angle_deg=angle,
             length_pos=arm_results["pos"][0],
             length_neg=arm_results["neg"][0],
             length_total=arm_results["pos"][0] + arm_results["neg"][0],
-            profile_pos=arm_results["pos"][2],
-            profile_neg=arm_results["neg"][2],
-            radii_pos=arm_results["pos"][1],
-            radii_neg=arm_results["neg"][1],
+            profile_pos=_empty if low_memory else arm_results["pos"][2],
+            profile_neg=_empty if low_memory else arm_results["neg"][2],
+            radii_pos=_empty if low_memory else arm_results["pos"][1],
+            radii_neg=_empty if low_memory else arm_results["neg"][1],
             converged_pos=arm_results["pos"][3],
             converged_neg=arm_results["neg"][3],
             popt=None,
             threshold=threshold,
-            background_profile=bg_profile_result,
+            background_profile=None if low_memory else bg_profile_result,
             swath_width=swath_width,
         ))
 

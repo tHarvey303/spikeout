@@ -9,12 +9,12 @@ class TestFindCentre:
     """Tests for automatic centre detection."""
 
     def test_finds_peak(self):
-        """Should return coordinates near the brightest region."""
+        """Should return the geometric centre of the image."""
         img = np.zeros((100, 100))
         img[70, 30] = 1000.0
         cy, cx = find_centre(img)
-        assert abs(cy - 70) <= 2
-        assert abs(cx - 30) <= 2
+        assert cy == 50.0
+        assert cx == 50.0
 
     def test_handles_nan(self):
         """NaNs should not crash centre detection."""

@@ -31,7 +31,7 @@ def find_centre(image):
     return (float(ny) / 2.0, float(nx) / 2.0)
 
 
-def azimuthal_median(image, centre=None, radial_bin_width=1):
+def azimuthal_median(image, centre=None, radial_bin_width=1, _R=None):
     """Compute the azimuthal (annular) median at each pixel.
 
     The result is a smooth, radially symmetric model of the PSF core +
@@ -45,6 +45,10 @@ def azimuthal_median(image, centre=None, radial_bin_width=1):
         Centre of the radial profile.  Uses the image centre if *None*.
     radial_bin_width : int
         Width of each annular bin in pixels.
+    _R : 2-D array or *None*
+        Pre-computed distance array ``sqrt((X-cx)²+(Y-cy)²)``.  Computed
+        internally when *None*.  Pass this to avoid recomputing it when
+        the same centre is used across multiple calls.
 
     Returns
     -------
@@ -56,22 +60,28 @@ def azimuthal_median(image, centre=None, radial_bin_width=1):
     else:
         cy, cx = centre
 
-    Y, X = np.mgrid[:ny, :nx]
-    R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    if _R is None:
+        Y, X = np.ogrid[:ny, :nx]
+        _R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
 
-    r_int = (R / radial_bin_width).astype(int)
-    max_bin = r_int.max() + 1
-
-    model = np.zeros_like(image)
+    bin_idx = (_R / radial_bin_width).astype(np.intp).ravel()
     flat_img = image.ravel()
-    flat_r = r_int.ravel()
+    max_bin = int(bin_idx.max()) + 1
 
+    # Sort once so each bin is a contiguous slice — O(N log N) upfront,
+    # then O(bin_size) per bin with no boolean mask allocation per bin.
+    sort_idx = np.argsort(bin_idx, kind='stable')
+    sorted_vals = flat_img[sort_idx]
+    sorted_bins = bin_idx[sort_idx]
+    boundaries = np.searchsorted(sorted_bins, np.arange(max_bin + 1))
+
+    model_flat = np.empty(ny * nx, dtype=float)
     for b in range(max_bin):
-        mask = flat_r == b
-        if mask.any():
-            model.ravel()[mask] = np.nanmedian(flat_img[mask])
+        s, e = int(boundaries[b]), int(boundaries[b + 1])
+        if e > s:
+            model_flat[sort_idx[s:e]] = np.nanmedian(sorted_vals[s:e])
 
-    return model
+    return model_flat.reshape(ny, nx)
 
 
 def prepare_image(
@@ -134,10 +144,17 @@ def prepare_image(
     elif centre == 'auto':
         centre = find_centre(image)
 
+    # Compute the distance array once and reuse it for both the azimuthal
+    # median and the asinh stretch inner-radius mask.
+    ny, nx = image.shape
+    cy, cx = float(centre[0]), float(centre[1])
+    Y, X = np.ogrid[:ny, :nx]
+    R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+
     if subtract_median:
         # 1. azimuthal median subtraction
         model = azimuthal_median(
-            image, centre=centre, radial_bin_width=radial_bin_width,
+            image, centre=centre, radial_bin_width=radial_bin_width, _R=R,
         )
         residual = image - model
     else:
@@ -159,14 +176,9 @@ def prepare_image(
         return residual
 
     if asinh_stretch is None:
-        # Compute the scale from the inner ~50% of the image radius so that
-        # bright off-centre sources do not compress the central spike signal.
-        ny, nx = residual.shape
-        cy, cx = ny / 2.0, nx / 2.0
-        Y, X = np.ogrid[:ny, :nx]
-        inner_r = min(ny, nx) / 4.0  # 50 % of the half-size
-        inner_mask = ((X - cx) ** 2 + (Y - cy) ** 2) <= inner_r ** 2
-        inner_pos = residual[inner_mask & (residual > 0)]
+        # Reuse R — no second distance computation needed.
+        inner_r = min(ny, nx) / 4.0
+        inner_pos = residual[(R <= inner_r) & (residual > 0)]
         asinh_stretch = np.median(inner_pos) if inner_pos.size > 0 \
             else np.median(pos)
     if asinh_stretch <= 0:

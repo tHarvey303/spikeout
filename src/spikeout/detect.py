@@ -344,6 +344,12 @@ def detect(
         max_rho_px=max_rho_px,
     )
 
+    # ── low-memory mode: drop large arrays not needed for downstream work ─
+    low_memory = prep_kw.pop('low_memory', False)
+    if low_memory:
+        result.sinogram = None
+        result.prepared_image = None
+
     # ── optional length measurement ──────────────────────────────────────
     if min_length is not None and not measure_lengths:
         warnings.warn(
@@ -353,7 +359,9 @@ def detect(
         )
 
     if measure_lengths and len(peaks_1d) > 0:
-        kw = length_kw or {}
+        kw = dict(length_kw or {})
+        if low_memory:
+            kw.setdefault('low_memory', True)
         result.lengths = measure_spike_lengths(image, result, **kw)
 
         if min_length is not None:
