@@ -10,7 +10,14 @@ import warnings
 from .detect import detect, SpikeResult
 from .regions import halo_mask as _halo_mask
 
-__all__ = ["CatalogueEntry", "catalogue_detect", "catalogue_summary", "plot_catalogue"]
+__all__ = [
+    "CatalogueEntry",
+    "catalogue_detect",
+    "catalogue_halo",
+    "combine_entries",
+    "catalogue_summary",
+    "plot_catalogue",
+]
 
 warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 
@@ -263,6 +270,186 @@ def catalogue_detect(
                     ))
 
     return entries
+
+
+def catalogue_halo(
+    coords,
+    image_path,
+    cutout_size=256,
+    hdu_index=0,
+    n_jobs=1,
+    halo_mask_kw=None,
+) -> List["CatalogueEntry"]:
+    """Run halo masking only over a list of sky positions.
+
+    Lighter-weight alternative to `catalogue_detect` for sources where spike
+    detection is not needed — only the stellar halo aperture is measured.
+    Returns ``CatalogueEntry`` objects with ``halo_mask`` / ``halo_radius``
+    populated and ``result=None``.
+
+    Parameters
+    ----------
+    coords : sequence of (ra, dec) in degrees, or `~astropy.coordinates.SkyCoord`
+    image_path : str or path-like
+        Path to the FITS image.
+    cutout_size : int or sequence of int
+        Side length of each square cutout in pixels.
+    hdu_index : int
+        HDU index.  Default 0.
+    n_jobs : int
+        Number of parallel worker threads.  ``1`` (default) runs
+        sequentially.  ``-1`` uses all available CPU threads.
+    halo_mask_kw : dict or None
+        Keyword arguments forwarded to `~spikeout.regions.halo_mask`.
+        Pass ``{}`` to use all defaults.
+
+    Returns
+    -------
+    list of `CatalogueEntry`
+    """
+    try:
+        from astropy.io import fits
+        from astropy.wcs import WCS
+        from astropy.nddata import Cutout2D
+        from astropy.coordinates import SkyCoord
+    except ImportError:
+        raise ImportError(
+            "astropy is required for catalogue_halo. "
+            "Install with: pip install 'spikeout[astropy]'"
+        )
+
+    _hmkw = halo_mask_kw or {}
+
+    if not hasattr(coords, 'ra'):
+        coords = SkyCoord(
+            [c[0] for c in coords],
+            [c[1] for c in coords],
+            unit='deg',
+        )
+
+    if hasattr(cutout_size, '__len__') and len(cutout_size) != len(coords):
+        raise ValueError(
+            f"cutout_size has {len(cutout_size)} elements but coords has "
+            f"{len(coords)}"
+        )
+
+    sizes = (
+        [(s, s) for s in cutout_size]
+        if hasattr(cutout_size, '__len__')
+        else [(cutout_size, cutout_size)] * len(coords)
+    )
+
+    # ── Phase 1: extract cutouts ──────────────────────────────────────────
+    raw = []
+    with fits.open(image_path, memmap=True) as hdul:
+        hdu = hdul[hdu_index]
+        image_wcs = WCS(hdu.header)
+        data = hdu.data
+
+        for sky, size in zip(coords, sizes):
+            try:
+                co = Cutout2D(
+                    data, sky, size, wcs=image_wcs,
+                    mode='partial', fill_value=np.nan,
+                    copy=True,
+                )
+                raw.append((
+                    float(sky.ra.deg), float(sky.dec.deg),
+                    co.data.astype(float), co.wcs, None,
+                ))
+            except Exception as exc:
+                raw.append((
+                    float(sky.ra.deg), float(sky.dec.deg),
+                    None, None, str(exc),
+                ))
+
+    # ── Phase 2: halo mask (optionally parallel) ──────────────────────────
+    def _run_one(cutout_data):
+        return _halo_mask(cutout_data, **_hmkw)
+
+    entries: List[CatalogueEntry] = []
+
+    if n_jobs == 1:
+        for ra, dec, cutout_data, cutout_wcs, error in tqdm(
+            raw, desc="Measuring halos"
+        ):
+            if error is not None:
+                entries.append(CatalogueEntry(
+                    ra=ra, dec=dec, cutout=None, result=None, error=error,
+                ))
+            else:
+                try:
+                    hmask, hradius = _run_one(cutout_data)
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cutout_data, result=None,
+                        wcs=cutout_wcs, halo_mask=hmask, halo_radius=hradius,
+                    ))
+                except Exception as exc:
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cutout_data, result=None,
+                        error=str(exc), wcs=cutout_wcs,
+                    ))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = None if n_jobs == -1 else n_jobs
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_run_one, cd) if error is None else None
+                for _, _, cd, _, error in raw
+            ]
+
+        for (ra, dec, cd, cwcs, error), future in tqdm(
+            zip(raw, futures), total=len(raw), desc="Measuring halos"
+        ):
+            if error is not None:
+                entries.append(CatalogueEntry(
+                    ra=ra, dec=dec, cutout=None, result=None, error=error,
+                ))
+            elif future is None:
+                entries.append(CatalogueEntry(
+                    ra=ra, dec=dec, cutout=cd, result=None,
+                    error="cutout extraction failed",
+                ))
+            else:
+                try:
+                    hmask, hradius = future.result()
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cd, result=None,
+                        wcs=cwcs, halo_mask=hmask, halo_radius=hradius,
+                    ))
+                except Exception as exc:
+                    entries.append(CatalogueEntry(
+                        ra=ra, dec=dec, cutout=cd, result=None,
+                        error=str(exc), wcs=cwcs,
+                    ))
+
+    return entries
+
+
+def combine_entries(*lists) -> List["CatalogueEntry"]:
+    """Concatenate multiple lists of ``CatalogueEntry`` objects.
+
+    Entries from all lists are combined into a single flat list suitable
+    for passing to `write_spike_mask_fits`, `catalogue_summary`, or
+    `plot_catalogue`.  No deduplication is performed — if the same sky
+    position appears in more than one list, both entries are kept (and
+    both contributions will be rasterised into the mask).
+
+    Parameters
+    ----------
+    *lists : list of CatalogueEntry
+        Any number of entry lists, e.g. from `catalogue_detect` and
+        `catalogue_halo`.
+
+    Returns
+    -------
+    list of CatalogueEntry
+    """
+    result = []
+    for lst in lists:
+        result.extend(lst)
+    return result
 
 
 def catalogue_summary(entries) -> dict:
