@@ -231,6 +231,7 @@ def detect(
         raise ValueError("Image has zero variance (constant or trivial)")
 
     # ── preprocessing ────────────────────────────────────────────────────
+    low_memory = prep_kw.pop('low_memory', False)
     prepared = prepare_image(image, **prep_kw)
 
     # -- cropping for angle estimation ────────────────────────────────────
@@ -281,8 +282,9 @@ def detect(
     )))
     peaks_1d, _ = find_peaks(
         max_along_rho,
-        height=abs_threshold,
+        #height=abs_threshold,
         distance=min_sep_idx,
+        prominence=peak_prominence,# * np.ptp(max_along_rho)
     )
 
     # Find the brightest ρ within the central band for each detected angle.
@@ -345,7 +347,6 @@ def detect(
     )
 
     # ── low-memory mode: drop large arrays not needed for downstream work ─
-    low_memory = prep_kw.pop('low_memory', False)
     if low_memory:
         result.sinogram = None
         result.prepared_image = None

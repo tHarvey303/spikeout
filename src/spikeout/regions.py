@@ -242,6 +242,7 @@ def write_catalogue_ds9_regions(
     max_width=None,
     colour="green",
     image_pa_deg=0.0,
+    verbose=True,
 ):
     """Write a DS9 region file for a list of ``CatalogueEntry`` objects.
 
@@ -271,6 +272,8 @@ def write_catalogue_ds9_regions(
     image_pa_deg : float
         Position angle of the image's +y axis (degrees East of North).
         Default 0 (North up).  Adjust for non-standard orientations.
+    verbose : bool
+        If *True*, print warnings about entries with missing length measurements.
 
     Notes
     -----
@@ -284,10 +287,11 @@ def write_catalogue_ds9_regions(
 
     for entry in entries:
         if entry.result is None or entry.result.lengths is None:
-            print(f"Warning: entry {entry} has result.lengths = None; skipping")
-            if entry.result is not None and entry.result.lengths is None:
+            if verbose:
                 print(f"Warning: entry {entry} has result.lengths = None; skipping")
-            
+            if entry.result is not None and entry.result.lengths is None:
+                if verbose:
+                    print(f"Warning: entry {entry} has result.lengths = None; skipping")
             continue
 
         dec_rad = np.deg2rad(entry.dec)
