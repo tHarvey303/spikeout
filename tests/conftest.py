@@ -80,6 +80,18 @@ def star_offset(rng):
 
 
 @pytest.fixture
+def star_offset_with_centre(rng):
+    """256×256 offset star that also exposes the true star position.
+
+    Returns ``(image, true_col, true_row)`` so tests can verify that the
+    Radon-derived corrected centre lands closer to the true star than the
+    image centre does.
+    """
+    img, cx, cy = _make_star_with_spikes(rng, centre_offset=(15, -10))
+    return img, cx, cy  # cx = true column, cy = true row
+
+
+@pytest.fixture
 def star_asymmetric(rng):
     """256×256 star with asymmetric spike arm lengths."""
     img, cx, cy = _make_star_with_spikes(rng, asymmetric=True)

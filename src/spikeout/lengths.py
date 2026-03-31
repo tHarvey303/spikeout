@@ -537,11 +537,12 @@ def measure_spike_lengths(
     # ── per-spike measurement ─────────────────────────────────────────────
     lengths = []
     for i in range(len(result.angles)):
-        rho = result.rho_physical[i]
-        th_rad = np.deg2rad(theta[pk_th[i]])
-        # star-centre position in the cutout (column, row)
-        x0 = nx / 2.0 + rho * np.cos(th_rad)
-        y0 = ny / 2.0 - rho * np.sin(th_rad)
+        # Arm start: use the resolved star centre (cx, cy).
+        # When centre was explicitly provided (e.g. from recenter_for_lengths)
+        # this is the corrected star position; otherwise it is the image centre
+        # returned by find_centre(), which is equivalent to the Radon
+        # foot-of-perpendicular for well-centred stars (rho ≈ 0).
+        x0, y0 = cx, cy
         angle = result.angles[i]
 
         arm_results = {}

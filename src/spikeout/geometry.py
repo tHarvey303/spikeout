@@ -23,7 +23,45 @@ import numpy as np
 __all__ = [
     "sinogram_rho_to_physical",
     "radon_line_to_image",
+    "calculate_star_offset",
 ]
+
+
+def calculate_star_offset(radon_peaks):
+    """Calculate the (dx, dy) offset of a star from the image centre.
+
+    Uses the fact that all diffraction spikes pass through the star, so their
+    Radon (ρ, θ) values satisfy the over-determined linear system
+    ``dx cos θ + dy sin θ = ρ``.  Solves via least squares.
+
+    The returned offset is in the Radon y-up frame::
+
+        col_star = col_centre + dx
+        row_star = row_centre − dy
+
+    Parameters
+    ----------
+    radon_peaks : list of (rho, theta) tuples
+        ``rho`` is the signed physical perpendicular distance (pixels) from
+        the image centre; ``theta`` is in **radians** (Radon projection angle,
+        0–π).
+
+    Returns
+    -------
+    dx, dy : float
+        Column and (y-up) row offsets of the star from the image centre.
+        Convert to image-plane ``(row, col)`` via
+        ``row_star = ny/2 − dy``, ``col_star = nx/2 + dx``.
+    """
+    A = []
+    b = []
+    for rho, theta in radon_peaks:
+        A.append([np.cos(theta), np.sin(theta)])
+        b.append(rho)
+    A_mat = np.array(A, dtype=float)
+    b_mat = np.array(b, dtype=float)
+    offset, _, _, _ = np.linalg.lstsq(A_mat, b_mat, rcond=None)
+    return float(offset[0]), float(offset[1])
 
 
 def sinogram_rho_to_physical(row_indices, n_rho):

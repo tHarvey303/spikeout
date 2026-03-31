@@ -3,7 +3,7 @@
 from .detect import detect, SpikeResult
 from .lengths import measure_spike_lengths, SpikeLengths
 from .preprocess import prepare_image, azimuthal_median, find_centre
-from .geometry import radon_line_to_image, sinogram_rho_to_physical
+from .geometry import radon_line_to_image, sinogram_rho_to_physical, calculate_star_offset
 from .plotting import plot_diagnostics
 from .catalogue import catalogue_detect, catalogue_summary, plot_catalogue, CatalogueEntry, catalogue_halo
 from .stars import fetch_gaia_stars
@@ -24,6 +24,7 @@ __all__ = [
     # geometry
     "radon_line_to_image",
     "sinogram_rho_to_physical",
+    "calculate_star_offset",
     # plotting
     "plot_diagnostics",
     # catalogue

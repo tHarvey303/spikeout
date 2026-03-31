@@ -6,6 +6,64 @@ import numpy as np
 __all__ = ["fetch_gaia_stars"]
 
 
+def _proximity_filter(table, mag_col, sep_arcsec):
+    """Remove the fainter source from each close pair in *table*.
+
+    For every pair of rows whose propagated sky positions are within
+    *sep_arcsec* of each other, the row with the larger (fainter) value in
+    *mag_col* is removed.  Rows with NaN magnitudes are treated as infinitely
+    faint.  The brighter source of each pair is always retained.
+
+    Parameters
+    ----------
+    table : `~astropy.table.Table`
+        Must contain ``ra_epoch``, ``dec_epoch`` (degrees) and *mag_col*.
+    mag_col : str
+        Column name used to compare brightness.
+    sep_arcsec : float
+        Angular separation threshold in arcseconds.
+
+    Returns
+    -------
+    `~astropy.table.Table`
+        Filtered table (a new masked view, not a copy of the full array).
+    int
+        Number of rows removed.
+    """
+    try:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+    except ImportError:
+        raise ImportError("astropy is required for proximity filtering.")
+
+    if len(table) <= 1:
+        return table, 0
+
+    coords = SkyCoord(
+        ra=np.array(table["ra_epoch"], dtype=float) * u.deg,
+        dec=np.array(table["dec_epoch"], dtype=float) * u.deg,
+    )
+    idx1, idx2, _, _ = coords.search_around_sky(
+        coords, seplimit=sep_arcsec * u.arcsec,
+    )
+    # Each unordered pair once; self-matches excluded by idx1 < idx2
+    pair_mask = idx1 < idx2
+    idx1, idx2 = idx1[pair_mask], idx2[pair_mask]
+
+    raw_mags = np.array(table[mag_col], dtype=float)
+    mags = np.where(np.isfinite(raw_mags), raw_mags, np.inf)
+
+    remove = np.zeros(len(table), dtype=bool)
+    for i, j in zip(idx1, idx2):
+        if mags[i] <= mags[j]:
+            remove[j] = True
+        else:
+            remove[i] = True
+
+    n_removed = int(remove.sum())
+    return table[~remove], n_removed
+
+
 def fetch_gaia_stars(
     fits_path,
     epoch,
@@ -14,6 +72,7 @@ def fetch_gaia_stars(
     mag_limit=None,
     mag_col="phot_g_mean_mag",
     gaia_row_limit=10_000_000,
+    min_separation_arcsec=None,
     output_path=None,
     verbose=True,
 ):
@@ -52,6 +111,14 @@ def fetch_gaia_stars(
         Magnitude column used for *mag_limit*.  Default ``'phot_g_mean_mag'``.
     gaia_row_limit : int
         Maximum rows returned by the Gaia TAP query.  Default 10 000 000.
+    min_separation_arcsec : float or None
+        If given, sources with a brighter neighbour (in ``mag_col``) within
+        this angular distance are removed.  For each pair of sources closer
+        than the threshold, the fainter one is dropped; the brighter is kept.
+        Sources with no magnitude measurement (NaN) are treated as the
+        faintest possible and will be dropped in favour of any measured
+        neighbour.  Applied after the ``mag_limit`` cut.  Default *None*
+        (no proximity filtering).
     output_path : str or path-like or None
         If provided, the table is written to this FITS path (overwriting any
         existing file).
@@ -185,6 +252,17 @@ def fetch_gaia_stars(
         ]
         if verbose:
             print(f"  {len(gaia_table)} sources after {mag_col} < {mag_limit} cut.")
+
+    # ── Optional proximity filter (remove fainter of each close pair) ────
+    if min_separation_arcsec is not None:
+        gaia_table, n_removed = _proximity_filter(
+            gaia_table, mag_col, min_separation_arcsec,
+        )
+        if verbose:
+            print(
+                f"  {len(gaia_table)} sources after proximity filter "
+                f"({min_separation_arcsec} arcsec; {n_removed} neighbours removed)."
+            )
 
     # ── Optional write ────────────────────────────────────────────────────
     if output_path is not None:

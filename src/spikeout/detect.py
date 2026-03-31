@@ -10,7 +10,7 @@ from scipy.ndimage import maximum_filter
 from scipy.signal import find_peaks
 from skimage.transform import radon
 
-from .geometry import sinogram_rho_to_physical, radon_line_to_image
+from .geometry import sinogram_rho_to_physical, radon_line_to_image, calculate_star_offset
 from .preprocess import prepare_image
 from .lengths import SpikeLengths, measure_spike_lengths
 
@@ -56,6 +56,15 @@ class SpikeResult:
     n_rejected_snr: int = 0
     lengths: Optional[List[SpikeLengths]] = None
     max_rho_px: float = 0.0
+    star_centre_offset: Optional[tuple] = None
+    """(dx, dy) offset of star from image centre in Radon y-up pixel coords.
+    Populated when ``recenter_for_lengths=True`` and ≥ 2 spikes are found.
+    ``col_star = nx/2 + dx``, ``row_star = ny/2 − dy``."""
+    corrected_centre: Optional[tuple] = None
+    """(row, col) corrected star centre in image pixel coords.
+    Set when ``recenter_for_lengths=True`` and the computed offset is within
+    ``max_center_offset``.  Passed automatically to ``measure_spike_lengths``
+    and stored for downstream use (e.g. ``catalogue_detect``)."""
 
     def __repr__(self) -> str:
         n = len(self.angles)
@@ -69,6 +78,9 @@ class SpikeResult:
                 + ", ".join(f"{sl.length_total:.0f}px" for sl in self.lengths)
                 + "]"
             )
+        if self.star_centre_offset is not None:
+            dx, dy = self.star_centre_offset
+            parts.append(f"star_offset=({dx:.1f},{dy:.1f})px")
         return f"SpikeResult({', '.join(parts)})"
 
 
@@ -133,6 +145,9 @@ def detect(
     measure_lengths=False,
     length_kw=None,
     min_length=None,
+    # ── star centre correction for lengths ──
+    recenter_for_lengths=False,
+    max_center_offset=None,
     # ── preprocessing ──
     **prep_kw,
 ):
@@ -207,6 +222,24 @@ def detect(
         Minimum total spike length in pixels.  Spikes shorter than this
         are dropped after arm measurement.  Requires
         ``measure_lengths=True``; a warning is issued if set otherwise.
+
+    recenter_for_lengths : bool
+        If *True*, solve for the true star centre using the detected
+        Radon peaks (all spike lines must pass through the star).  The
+        corrected centre is stored in ``SpikeResult.corrected_centre``
+        and used as the arm-start reference in
+        `~spikeout.lengths.measure_spike_lengths`, so that length
+        measurements are not biased by a poorly centred cutout.
+        Requires at least 2 detected spikes; silently skipped otherwise.
+        Default *False*.
+
+    max_center_offset : float or *None*
+        Maximum allowed displacement (pixels) between the image centre
+        and the Radon-derived star centre.  If the computed offset
+        exceeds this threshold the correction is discarded and
+        ``SpikeResult.corrected_centre`` is left as *None* (though
+        ``SpikeResult.star_centre_offset`` still records the computed
+        value for diagnostics).  *None* (default) applies no limit.
 
     **prep_kw
         Extra keyword arguments forwarded to
@@ -346,6 +379,23 @@ def detect(
         max_rho_px=max_rho_px,
     )
 
+    # ── optional star centre correction ──────────────────────────────────
+    # Solve for the true star position using the detected (ρ, θ) pairs.
+    # All spike lines must pass through the star, so:
+    #   dx cos θ + dy sin θ = ρ   for each spike
+    # Least-squares gives the best-fit (dx, dy) offset from image centre.
+    if recenter_for_lengths and len(peaks_1d) >= 2:
+        radon_peaks = [
+            (float(rho_phys[i]), float(np.deg2rad(theta[peaks_1d[i]])))
+            for i in range(len(peaks_1d))
+        ]
+        dx, dy = calculate_star_offset(radon_peaks)
+        offset_dist = float(np.hypot(dx, dy))
+        result.star_centre_offset = (dx, dy)
+        if max_center_offset is None or offset_dist <= max_center_offset:
+            ny_im, nx_im = image.shape
+            result.corrected_centre = (ny_im / 2.0 - dy, nx_im / 2.0 + dx)
+
     # ── low-memory mode: drop large arrays not needed for downstream work ─
     if low_memory:
         result.sinogram = None
@@ -363,6 +413,8 @@ def detect(
         kw = dict(length_kw or {})
         if low_memory:
             kw.setdefault('low_memory', True)
+        if result.corrected_centre is not None:
+            kw.setdefault('centre', result.corrected_centre)
         result.lengths = measure_spike_lengths(image, result, **kw)
 
         if min_length is not None:

@@ -63,7 +63,11 @@ def spike_mask(
 
     nrows, ncols = image_shape
     if centre is None:
-        cx, cy = ncols / 2.0, nrows / 2.0
+        if getattr(result, 'corrected_centre', None) is not None:
+            row, col = result.corrected_centre
+            cx, cy = float(col), float(row)
+        else:
+            cx, cy = ncols / 2.0, nrows / 2.0
     else:
         row, col = centre
         cx, cy = float(col), float(row)
@@ -159,7 +163,11 @@ def spike_box_regions(
 
     nrows, ncols = image_shape
     if centre is None:
-        cx, cy = ncols / 2.0, nrows / 2.0
+        if getattr(result, 'corrected_centre', None) is not None:
+            row, col = result.corrected_centre
+            cx, cy = float(col), float(row)
+        else:
+            cx, cy = ncols / 2.0, nrows / 2.0
     else:
         row, col = centre
         cx, cy = float(col), float(row)

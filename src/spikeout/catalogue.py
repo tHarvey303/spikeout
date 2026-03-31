@@ -232,6 +232,9 @@ def catalogue_detect(
             kw.setdefault('full_array', full_array)
             kw.setdefault('centre_col_full', px_col)
             kw.setdefault('centre_row_full', px_row)
+        # Use Radon-derived corrected star centre if computed during detection.
+        if result.corrected_centre is not None:
+            kw.setdefault('centre', result.corrected_centre)
         result.lengths = _measure_spike_lengths(cutout_data, result, **kw)
 
     def _build_entry(ra, dec, cd, cwcs, result, hmask, hradius):
