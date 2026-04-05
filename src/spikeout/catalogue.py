@@ -321,6 +321,7 @@ def catalogue_halo(
     hdu_index=0,
     n_jobs=1,
     halo_mask_kw=None,
+    batch_size=500,
 ) -> List["CatalogueEntry"]:
     """Run halo masking only over a list of sky positions.
 
@@ -328,6 +329,10 @@ def catalogue_halo(
     detection is not needed — only the stellar halo aperture is measured.
     Returns ``CatalogueEntry`` objects with ``halo_mask`` / ``halo_radius``
     populated and ``result=None``.
+
+    Cutouts are processed in batches of ``batch_size`` to keep peak RAM usage
+    bounded: each batch is extracted, processed, and discarded before the next
+    batch is read.
 
     Parameters
     ----------
@@ -344,6 +349,9 @@ def catalogue_halo(
     halo_mask_kw : dict or None
         Keyword arguments forwarded to `~spikeout.regions.halo_mask`.
         Pass ``{}`` to use all defaults.
+    batch_size : int
+        Number of sources to extract and process at a time.  Larger batches
+        are faster (less overhead) but use more RAM.  Default 500.
 
     Returns
     -------
@@ -381,90 +389,99 @@ def catalogue_halo(
         else [(cutout_size, cutout_size)] * len(coords)
     )
 
-    # ── Phase 1: extract cutouts ──────────────────────────────────────────
-    raw = []
+    def _run_one(cutout_data):
+        return _halo_mask(cutout_data, **_hmkw)
+
+    entries: List[CatalogueEntry] = []
+    n_total = len(coords)
+
+    if n_jobs != 1:
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = None if n_jobs == -1 else n_jobs
+
     with fits.open(image_path, memmap=True) as hdul:
         hdu = hdul[hdu_index]
         image_wcs = WCS(hdu.header)
         data = hdu.data
 
-        for sky, size in zip(coords, sizes):
-            try:
-                co = Cutout2D(
-                    data, sky, size, wcs=image_wcs,
-                    mode='partial', fill_value=np.nan,
-                    copy=True,
-                )
-                raw.append((
-                    float(sky.ra.deg), float(sky.dec.deg),
-                    co.data.astype(float), co.wcs, None,
-                ))
-            except Exception as exc:
-                raw.append((
-                    float(sky.ra.deg), float(sky.dec.deg),
-                    None, None, str(exc),
-                ))
+        with tqdm(total=n_total, desc="Measuring halos") as pbar:
+            for batch_start in range(0, n_total, batch_size):
+                batch_end = min(batch_start + batch_size, n_total)
+                batch_coords = coords[batch_start:batch_end]
+                batch_sizes = sizes[batch_start:batch_end]
 
-    # ── Phase 2: halo mask (optionally parallel) ──────────────────────────
-    def _run_one(cutout_data):
-        return _halo_mask(cutout_data, **_hmkw)
+                # ── Extract batch cutouts ─────────────────────────────────
+                raw = []
+                for sky, size in zip(batch_coords, batch_sizes):
+                    try:
+                        co = Cutout2D(
+                            data, sky, size, wcs=image_wcs,
+                            mode='partial', fill_value=np.nan,
+                            copy=True,
+                        )
+                        raw.append((
+                            float(sky.ra.deg), float(sky.dec.deg),
+                            co.data.astype(float), co.wcs, None,
+                        ))
+                    except Exception as exc:
+                        raw.append((
+                            float(sky.ra.deg), float(sky.dec.deg),
+                            None, None, str(exc),
+                        ))
 
-    entries: List[CatalogueEntry] = []
+                # ── Process batch ─────────────────────────────────────────
+                if n_jobs == 1:
+                    for ra, dec, cutout_data, cutout_wcs, error in raw:
+                        if error is not None:
+                            entries.append(CatalogueEntry(
+                                ra=ra, dec=dec, cutout=None, result=None, error=error,
+                            ))
+                        else:
+                            try:
+                                hmask, hradius = _run_one(cutout_data)
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec, cutout=cutout_data, result=None,
+                                    wcs=cutout_wcs, halo_mask=hmask, halo_radius=hradius,
+                                ))
+                            except Exception as exc:
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec, cutout=cutout_data, result=None,
+                                    error=str(exc), wcs=cutout_wcs,
+                                ))
+                        pbar.update(1)
+                else:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(_run_one, cd) if error is None else None
+                            for _, _, cd, _, error in raw
+                        ]
+                    # executor.__exit__ waits for all futures to complete
 
-    if n_jobs == 1:
-        for ra, dec, cutout_data, cutout_wcs, error in tqdm(
-            raw, desc="Measuring halos"
-        ):
-            if error is not None:
-                entries.append(CatalogueEntry(
-                    ra=ra, dec=dec, cutout=None, result=None, error=error,
-                ))
-            else:
-                try:
-                    hmask, hradius = _run_one(cutout_data)
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec, cutout=cutout_data, result=None,
-                        wcs=cutout_wcs, halo_mask=hmask, halo_radius=hradius,
-                    ))
-                except Exception as exc:
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec, cutout=cutout_data, result=None,
-                        error=str(exc), wcs=cutout_wcs,
-                    ))
-    else:
-        from concurrent.futures import ThreadPoolExecutor
-        max_workers = None if n_jobs == -1 else n_jobs
+                    for (ra, dec, cd, cwcs, error), future in zip(raw, futures):
+                        if error is not None:
+                            entries.append(CatalogueEntry(
+                                ra=ra, dec=dec, cutout=None, result=None, error=error,
+                            ))
+                        elif future is None:
+                            entries.append(CatalogueEntry(
+                                ra=ra, dec=dec, cutout=cd, result=None,
+                                error="cutout extraction failed",
+                            ))
+                        else:
+                            try:
+                                hmask, hradius = future.result()
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec, cutout=cd, result=None,
+                                    wcs=cwcs, halo_mask=hmask, halo_radius=hradius,
+                                ))
+                            except Exception as exc:
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec, cutout=cd, result=None,
+                                    error=str(exc), wcs=cwcs,
+                                ))
+                        pbar.update(1)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_run_one, cd) if error is None else None
-                for _, _, cd, _, error in raw
-            ]
-
-        for (ra, dec, cd, cwcs, error), future in tqdm(
-            zip(raw, futures), total=len(raw), desc="Measuring halos"
-        ):
-            if error is not None:
-                entries.append(CatalogueEntry(
-                    ra=ra, dec=dec, cutout=None, result=None, error=error,
-                ))
-            elif future is None:
-                entries.append(CatalogueEntry(
-                    ra=ra, dec=dec, cutout=cd, result=None,
-                    error="cutout extraction failed",
-                ))
-            else:
-                try:
-                    hmask, hradius = future.result()
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec, cutout=cd, result=None,
-                        wcs=cwcs, halo_mask=hmask, halo_radius=hradius,
-                    ))
-                except Exception as exc:
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec, cutout=cd, result=None,
-                        error=str(exc), wcs=cwcs,
-                    ))
+                del raw  # free this batch's cutout arrays before the next batch
 
     return entries
 
