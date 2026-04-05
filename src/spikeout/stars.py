@@ -39,6 +39,10 @@ def _proximity_filter(table, mag_col, sep_arcsec):
     if len(table) <= 1:
         return table, 0
 
+    if isinstance(table, str):
+        from astropy.table import Table
+        table = Table.read(table)
+
     coords = SkyCoord(
         ra=np.array(table["ra_epoch"], dtype=float) * u.deg,
         dec=np.array(table["dec_epoch"], dtype=float) * u.deg,

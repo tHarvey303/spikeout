@@ -256,6 +256,12 @@ def plot_diagnostics(image, result=None, max_rho_fraction=0.1, show_swath=False,
 
             # Arm endpoint markers (filled = converged, open = extrapolated)
             ymin_ax = ax.get_ylim()[0] if ax.get_ylim()[0] > 0 else 1e-30
+
+            max_arm_len = max(sl.length_pos, sl.length_neg)
+            # if the arm length is very short, zoom in to show the profile shape and
+            if max_arm_len < 0.1*len(sl.radii_pos):
+                ax.set_xlim(0, max_arm_len * 1.2)
+
             for arm_len, ls, converged in [
                 (sl.length_pos, "-", sl.converged_pos),
                 (sl.length_neg, "--", sl.converged_neg),

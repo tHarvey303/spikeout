@@ -187,7 +187,7 @@ def catalogue_detect(
     if measure_lengths and full_array is None:
         full_array = data  # same memmap, no extra open
 
-    for sky, size in zip(coords, sizes):
+    for sky, size in tqdm(zip(coords, sizes), total=len(coords), desc="Extracting cutouts"):
         try:
             px, py = image_wcs.world_to_pixel(sky)
             co = Cutout2D(

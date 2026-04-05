@@ -11,6 +11,8 @@ __all__ = [
     "write_ds9_regions",
     "write_catalogue_ds9_regions",
     "halo_mask",
+    "compress_fits_mask_to_bytes",
+    "decompress_bytes_to_fits_mask",
 ]
 
 
@@ -729,6 +731,65 @@ def write_spike_mask_fits(
 
     out_fits.flush()
     out_fits.close()
+
+def compress_fits_mask_to_bytes(image_path, output_path, hdu_index=0):
+    """Compress a FITS mask to a byte-packed .npz file with the smallest footprint.
+    Store dimensions as metadata in the .npz file for later reconstruction.
+
+    Examples of use:
+    >>> write_spike_mask_fits(entries, image_path, output_path)
+    >>> write_border_mask_fits(image_path, output_path, edge_distance_px)
+    >>> compress_fits_mask_to_bytes(output_path, compressed_output_path)
+
+    Examples of reconstruction:
+    >>> npz = np.load(compressed_output_path)
+    >>> packed_mask = npz['mask']
+    >>> height = npz['height']
+    >>> width = npz['width']
+    >>> mask = np.unpackbits(packed_mask)[:height * width].reshape((height, width))
+
+    """
+    from astropy.io import fits as _fits
+    from astropy.wcs import WCS as _WCS
+    with _fits.open(image_path, memmap=True) as fits:
+        mask_data = fits[hdu_index].data.astype(bool)
+        H, W = mask_data.shape
+        # Pack bits into bytes; the last byte may have unused bits if W is not a multiple of 8
+        packed_mask = np.packbits(mask_data, axis=-1)
+        # store WCS as string metadata in the .npz file for later use if needed
+        header = fits[hdu_index].header
+        wcs = _WCS(header)
+        wcs_header_str = wcs.to_header_string()
+
+        np.savez_compressed(output_path, mask=packed_mask, height=H, width=W, wcs_header=wcs_header_str)
+
+def decompress_bytes_to_fits_mask(npz_path, output_fits_path):
+    """Decompress a byte-packed .npz file back to a FITS mask file.
+
+    Examples of use:
+    >>> decompress_bytes_to_fits_mask(compressed_output_path, reconstructed_fits_path)
+
+    """
+    from astropy.io import fits as _fits
+    from astropy.wcs import WCS as _WCS
+    npz = np.load(npz_path)
+    packed_mask = npz['mask']
+    height = npz['height']
+    width = npz['width']
+    wcs_header_str = str(npz['wcs_header'])
+
+    # create header from the stored WCS string, then create WCS object from that header
+    wcs_header = _fits.Header.fromstring(wcs_header_str)
+    wcs = _WCS(wcs_header)
+
+    # Unpack bits and reshape to original dimensions
+    mask_data = np.unpackbits(packed_mask)[:height * width].reshape((height, width)).astype(np.uint8)
+
+    # Write to FITS with the original WCS header
+    hdu = _fits.PrimaryHDU(data=mask_data)
+    hdu.header.update(wcs.to_header())
+    hdu.writeto(output_fits_path, overwrite=True)
+    
 
 
 def write_border_mask_fits(

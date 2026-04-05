@@ -198,6 +198,7 @@ def _find_profile_end(
     threshold: float,
     run_length: Optional[int] = None,
     run_frac: float = 0.05,
+    max_run: int = 150,
     min_run: int = 16,
     above_frac: float = 0.25,
     pad_frac: float = 0.5,
@@ -243,6 +244,8 @@ def _find_profile_end(
         return 0
 
     W = run_length if run_length is not None else max(min_run, int(n * run_frac))
+    if W > max_run:
+        W = max_run
     W = max(1, W)
 
     above = (profile >= threshold)
@@ -355,6 +358,7 @@ def measure_spike_lengths(
     reducer="mean",
     run_frac=0.05,
     min_run=16,
+    max_run=150,
     above_frac=0.25,
     pad_frac=0.5,
     radial_bin_width=2,
@@ -424,6 +428,8 @@ def measure_spike_lengths(
         ``_find_profile_end`` window size as fraction of profile length.
     min_run : int
         ``_find_profile_end`` minimum window size (pixels).
+    max_run : int
+        ``_find_profile_end`` maximum window size (pixels).
     above_frac : float
         ``_find_profile_end`` fraction of window above threshold required.
     pad_frac : float
@@ -571,7 +577,7 @@ def measure_spike_lengths(
 
             end_idx = _find_profile_end(
                 profile_smooth, threshold,
-                run_frac=run_frac, min_run=min_run,
+                run_frac=run_frac, min_run=min_run, max_run=max_run,
                 above_frac=above_frac, pad_frac=pad_frac,
             )
 
@@ -611,7 +617,7 @@ def measure_spike_lengths(
 
                     end_idx_full = _find_profile_end(
                         profile_full_smooth, threshold,
-                        run_frac=run_frac, min_run=min_run,
+                        run_frac=run_frac, min_run=min_run, max_run=max_run,
                         above_frac=above_frac, pad_frac=pad_frac,
                     )
                     converged = (end_idx_full < len(profile_full) - 1)

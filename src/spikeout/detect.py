@@ -304,18 +304,25 @@ def detect(
     # All operations are restricted to sinogram_central (|ρ| ≤ max_rho_px)
     # so that off-centre bright sources never influence threshold, peak
     # locations, ρ assignment, or SNR estimation.
-    abs_threshold = peak_prominence * np.max(sinogram_central)
     local_max = maximum_filter(sinogram_central, size=local_max_window)
     peak_map = (sinogram_central == local_max) & (sinogram_central > 0)
 
     max_along_rho = np.max(sinogram_central * peak_map, axis=0)
+    
+    # remove floor from max_along_rho to prevent spurious peaks in flat profiles
+    min_rho = np.nanmin(max_along_rho[max_along_rho > 0])
+    max_along_rho -= min_rho
+    
+    abs_threshold = 0.6 * np.max(max_along_rho)
+
 
     min_sep_idx = max(1, int(np.round(
         min_peak_separation_deg / (180.0 / n_angles),
     )))
+
     peaks_1d, _ = find_peaks(
         max_along_rho,
-        #height=abs_threshold,
+        height=abs_threshold,
         distance=min_sep_idx,
         prominence=peak_prominence,# * np.ptp(max_along_rho)
     )
