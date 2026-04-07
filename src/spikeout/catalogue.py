@@ -77,12 +77,14 @@ def catalogue_detect(
     measure_lengths=False,
     length_kw=None,
     low_memory=False,
+    batch_size=500,
     **detect_kw,
 ) -> List[CatalogueEntry]:
     """Run spike detection on a list of sky positions in a FITS image.
 
     The FITS file is opened with memory-mapping so only the pixels that
-    fall inside the requested cutouts are read from disk.
+    fall inside the requested cutouts are read from disk.  Sources are
+    processed in batches of ``batch_size`` to keep peak RAM usage bounded.
 
     Parameters
     ----------
@@ -125,6 +127,9 @@ def catalogue_detect(
         retain all scalar results needed for mask writing and DS9 export
         (angles, SNR, lengths, halo radii, WCS) but cannot be used for
         diagnostic plotting.  Default *False*.
+    batch_size : int
+        Number of sources to extract and process at a time.  Larger batches
+        are faster (less overhead) but use more RAM.  Default 500.
     **detect_kw
         Forwarded to `~spikeout.detect.detect`.
 
@@ -170,46 +175,6 @@ def catalogue_detect(
     if low_memory:
         detect_kw = dict(detect_kw, low_memory=True)
 
-    # ── Phase 1: extract cutouts (sequential, file must stay open) ────────
-    # The file is kept open through phase 2 so full_array can be derived
-    # from the same memmap handle rather than re-opening the file.
-    # raw items: (ra, dec, cutout_data, cutout_wcs, px_col, px_row, error)
-    raw = []
-    _fits_handle = None  # kept open until end of phase 2
-
-    _fits_handle = fits.open(image_path, memmap=True)
-    hdu = _fits_handle[hdu_index]
-    image_wcs = WCS(hdu.header)
-    data = hdu.data  # memmap — pixels are not read until sliced
-
-    # Derive full_array from the open handle when measure_lengths is
-    # requested and no external full_array was supplied.
-    if measure_lengths and full_array is None:
-        full_array = data  # same memmap, no extra open
-
-    for sky, size in tqdm(zip(coords, sizes), total=len(coords), desc="Extracting cutouts"):
-        try:
-            px, py = image_wcs.world_to_pixel(sky)
-            co = Cutout2D(
-                data, sky, size, wcs=image_wcs,
-                mode='partial', fill_value=np.nan,
-                copy=True,
-            )
-            raw.append((
-                float(sky.ra.deg), float(sky.dec.deg),
-                # asarray avoids a copy when data is already float64
-                np.asarray(co.data, dtype=float), co.wcs,
-                float(px), float(py),
-                None,
-            ))
-        except Exception as exc:
-            raw.append((
-                float(sky.ra.deg), float(sky.dec.deg),
-                None, None, None, None, str(exc),
-            ))
-
-    # ── Phase 2: run detect (optionally parallel) ─────────────────────────
-    entries = []
     _lkw = dict(length_kw or {})
     if low_memory:
         _lkw.setdefault('low_memory', True)
@@ -246,70 +211,111 @@ def catalogue_detect(
             halo_radius=hradius,
         )
 
-    try:
-        if n_jobs == 1:
-            for ra, dec, cutout_data, cutout_wcs, px_col, px_row, error in tqdm(
-                raw, desc="Detecting spikes"
-            ):
-                if error is not None:
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec, cutout=None, result=None, error=error,
-                    ))
-                else:
+    entries = []
+    n_total = len(coords)
+
+    if n_jobs != 1:
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = None if n_jobs == -1 else n_jobs
+
+    with fits.open(image_path, memmap=True) as _fits_handle:
+        hdu = _fits_handle[hdu_index]
+        image_wcs = WCS(hdu.header)
+        data = hdu.data  # memmap — pixels are not read until sliced
+
+        # Derive full_array from the open handle when measure_lengths is
+        # requested and no external full_array was supplied.
+        if measure_lengths and full_array is None:
+            full_array = data  # same memmap, no extra open
+
+        with tqdm(total=n_total, desc="Detecting spikes") as pbar:
+            for batch_start in range(0, n_total, batch_size):
+                batch_end = min(batch_start + batch_size, n_total)
+                batch_coords = coords[batch_start:batch_end]
+                batch_sizes = sizes[batch_start:batch_end]
+
+                # ── Extract batch cutouts ─────────────────────────────────
+                # raw items: (ra, dec, cutout_data, cutout_wcs, px_col, px_row, error)
+                raw = []
+                for sky, size in zip(batch_coords, batch_sizes):
                     try:
-                        result, hmask, hradius = _run_one(cutout_data)
-                        if measure_lengths:
-                            _apply_lengths(cutout_data, result, px_col, px_row)
-                        entries.append(_build_entry(
-                            ra, dec, cutout_data, cutout_wcs,
-                            result, hmask, hradius,
+                        px, py = image_wcs.world_to_pixel(sky)
+                        co = Cutout2D(
+                            data, sky, size, wcs=image_wcs,
+                            mode='partial', fill_value=np.nan,
+                            copy=True,
+                        )
+                        raw.append((
+                            float(sky.ra.deg), float(sky.dec.deg),
+                            np.asarray(co.data, dtype=float), co.wcs,
+                            float(px), float(py),
+                            None,
                         ))
                     except Exception as exc:
-                        entries.append(CatalogueEntry(
-                            ra=ra, dec=dec,
-                            cutout=None if low_memory else cutout_data,
-                            result=None, error=str(exc), wcs=cutout_wcs,
+                        raw.append((
+                            float(sky.ra.deg), float(sky.dec.deg),
+                            None, None, None, None, str(exc),
                         ))
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-            max_workers = None if n_jobs == -1 else n_jobs
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(_run_one, cd) if error is None else None
-                    for _, _, cd, _, _, _, error in raw
-                ]
-
-            for (ra, dec, cd, cwcs, px_col, px_row, error), future in tqdm(
-                zip(raw, futures), total=len(raw), desc="Detecting spikes"
-            ):
-                if error is not None:
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec, cutout=None, result=None, error=error,
-                    ))
-                elif future is None:
-                    entries.append(CatalogueEntry(
-                        ra=ra, dec=dec,
-                        cutout=None if low_memory else cd,
-                        result=None, error="cutout extraction failed",
-                    ))
+                # ── Process batch ─────────────────────────────────────────
+                if n_jobs == 1:
+                    for ra, dec, cutout_data, cutout_wcs, px_col, px_row, error in raw:
+                        if error is not None:
+                            entries.append(CatalogueEntry(
+                                ra=ra, dec=dec, cutout=None, result=None, error=error,
+                            ))
+                        else:
+                            try:
+                                result, hmask, hradius = _run_one(cutout_data)
+                                if measure_lengths:
+                                    _apply_lengths(cutout_data, result, px_col, px_row)
+                                entries.append(_build_entry(
+                                    ra, dec, cutout_data, cutout_wcs,
+                                    result, hmask, hradius,
+                                ))
+                            except Exception as exc:
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec,
+                                    cutout=None if low_memory else cutout_data,
+                                    result=None, error=str(exc), wcs=cutout_wcs,
+                                ))
+                        pbar.update(1)
                 else:
-                    try:
-                        result, hmask, hradius = future.result()
-                        if measure_lengths:
-                            _apply_lengths(cd, result, px_col, px_row)
-                        entries.append(_build_entry(
-                            ra, dec, cd, cwcs, result, hmask, hradius,
-                        ))
-                    except Exception as exc:
-                        entries.append(CatalogueEntry(
-                            ra=ra, dec=dec,
-                            cutout=None if low_memory else cd,
-                            result=None, error=str(exc), wcs=cwcs,
-                        ))
-    finally:
-        if _fits_handle is not None:
-            _fits_handle.close()
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(_run_one, cd) if error is None else None
+                            for _, _, cd, _, _, _, error in raw
+                        ]
+                    # executor.__exit__ waits for all futures to complete
+
+                    for (ra, dec, cd, cwcs, px_col, px_row, error), future in zip(raw, futures):
+                        if error is not None:
+                            entries.append(CatalogueEntry(
+                                ra=ra, dec=dec, cutout=None, result=None, error=error,
+                            ))
+                        elif future is None:
+                            entries.append(CatalogueEntry(
+                                ra=ra, dec=dec,
+                                cutout=None if low_memory else cd,
+                                result=None, error="cutout extraction failed",
+                            ))
+                        else:
+                            try:
+                                result, hmask, hradius = future.result()
+                                if measure_lengths:
+                                    _apply_lengths(cd, result, px_col, px_row)
+                                entries.append(_build_entry(
+                                    ra, dec, cd, cwcs, result, hmask, hradius,
+                                ))
+                            except Exception as exc:
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec,
+                                    cutout=None if low_memory else cd,
+                                    result=None, error=str(exc), wcs=cwcs,
+                                ))
+                        pbar.update(1)
+
+                del raw  # free this batch's cutout arrays before the next batch
 
     return entries
 
