@@ -308,10 +308,11 @@ def detect(
     peak_map = (sinogram_central == local_max) & (sinogram_central > 0)
 
     max_along_rho = np.max(sinogram_central * peak_map, axis=0)
-    
+
     # remove floor from max_along_rho to prevent spurious peaks in flat profiles
-    min_rho = np.nanmin(max_along_rho[max_along_rho > 0])
-    max_along_rho -= min_rho
+    positive = max_along_rho[max_along_rho > 0]
+    if positive.size > 0:
+        max_along_rho -= positive.min()
     
     abs_threshold = 0.6 * np.max(max_along_rho)
 

@@ -22,6 +22,72 @@ __all__ = [
 warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 
 
+def _extract_cutout(data, px, py, size_hw, wcs_header):
+    """Fast cutout extraction without the ``Cutout2D`` overhead.
+
+    Avoids the double ``overlap_slices`` call and ``deepcopy(wcs)`` that
+    ``Cutout2D`` performs.  The cutout WCS is rebuilt from a pre-serialised
+    header string, which is faster than deep-copying a live WCS object.
+
+    Parameters
+    ----------
+    data : 2-D ndarray (may be a memmap)
+    px, py : float
+        Pixel coordinates of the cutout centre (x=col, y=row).
+    size_hw : (int, int)
+        Cutout shape as (height, width) = (n_rows, n_cols).
+    wcs_header : `~astropy.io.fits.Header`
+        Pre-serialised header from the full-image WCS
+        (``image_wcs.to_header(relax=True)``).
+
+    Returns
+    -------
+    cutout : ndarray, dtype float64
+        NaN-padded cutout array of shape ``size_hw``.
+    cutout_wcs : `~astropy.wcs.WCS`
+        WCS adjusted so that pixel (0, 0) corresponds to ``(col0, row0)``
+        in the original image frame.
+    """
+    from astropy.wcs import WCS
+
+    h, w = size_hw
+    ny, nx = data.shape
+
+    # Rounding matches Cutout2D / overlap_slices default (np.ceil)
+    row0 = int(np.ceil(py - h / 2.0))
+    col0 = int(np.ceil(px - w / 2.0))
+    row1 = row0 + h
+    col1 = col0 + w
+
+    r0c = max(0, row0)
+    r1c = min(ny, row1)
+    c0c = max(0, col0)
+    c1c = min(nx, col1)
+
+    if r0c >= r1c or c0c >= c1c:
+        raise ValueError("Star falls entirely outside image bounds.")
+
+    cutout = np.full((h, w), np.nan, dtype=float)
+    cutout[r0c - row0: r1c - row0, c0c - col0: c1c - col0] = data[r0c:r1c, c0c:c1c]
+
+    # Rebuild WCS from the pre-serialised header.  Parsing a FITS header via
+    # C-level libwcs is typically faster than deepcopying a live WCS Python
+    # object graph, especially when SIP distortion tables are present.
+    cutout_wcs = WCS(wcs_header)
+    cutout_wcs.wcs.crpix[0] -= col0
+    cutout_wcs.wcs.crpix[1] -= row0
+    cutout_wcs.array_shape = (h, w)
+    if cutout_wcs.sip is not None:
+        from astropy.wcs import Sip
+        sip = cutout_wcs.sip
+        cutout_wcs.sip = Sip(
+            sip.a, sip.b, sip.ap, sip.bp,
+            sip.crpix - np.array([col0, row0], dtype=float),
+        )
+
+    return cutout, cutout_wcs
+
+
 @dataclass
 class CatalogueEntry:
     """Detection result for a single catalogue source.
@@ -143,7 +209,6 @@ def catalogue_detect(
     try:
         from astropy.io import fits
         from astropy.wcs import WCS
-        from astropy.nddata import Cutout2D
         from astropy.coordinates import SkyCoord
     except ImportError:
         raise ImportError(
@@ -214,108 +279,123 @@ def catalogue_detect(
     entries = []
     n_total = len(coords)
 
+    # Thread pool is created once for the whole run so that per-batch
+    # construction/teardown overhead doesn't accumulate.
     if n_jobs != 1:
         from concurrent.futures import ThreadPoolExecutor
         max_workers = None if n_jobs == -1 else n_jobs
+        _executor = ThreadPoolExecutor(max_workers=max_workers)
+    else:
+        _executor = None
 
-    with fits.open(image_path, memmap=True) as _fits_handle:
-        hdu = _fits_handle[hdu_index]
-        image_wcs = WCS(hdu.header)
-        data = hdu.data  # memmap — pixels are not read until sliced
+    try:
+        with fits.open(image_path, memmap=True) as _fits_handle:
+            hdu = _fits_handle[hdu_index]
+            image_wcs = WCS(hdu.header)
+            data = hdu.data  # memmap — pixels are not read until sliced
 
-        # Derive full_array from the open handle when measure_lengths is
-        # requested and no external full_array was supplied.
-        if measure_lengths and full_array is None:
-            full_array = data  # same memmap, no extra open
+            if measure_lengths and full_array is None:
+                full_array = data  # same memmap, no extra open
 
-        with tqdm(total=n_total, desc="Detecting spikes") as pbar:
-            for batch_start in range(0, n_total, batch_size):
-                batch_end = min(batch_start + batch_size, n_total)
-                batch_coords = coords[batch_start:batch_end]
-                batch_sizes = sizes[batch_start:batch_end]
+            # Vectorised sky→pixel conversion for all coords at once —
+            # far cheaper than one call per star.
+            all_px, all_py = image_wcs.world_to_pixel(coords)
 
-                # ── Extract batch cutouts ─────────────────────────────────
-                # raw items: (ra, dec, cutout_data, cutout_wcs, px_col, px_row, error)
-                raw = []
-                for sky, size in zip(batch_coords, batch_sizes):
-                    try:
-                        px, py = image_wcs.world_to_pixel(sky)
-                        co = Cutout2D(
-                            data, sky, size, wcs=image_wcs,
-                            mode='partial', fill_value=np.nan,
-                            copy=True,
-                        )
-                        raw.append((
-                            float(sky.ra.deg), float(sky.dec.deg),
-                            np.asarray(co.data, dtype=float), co.wcs,
-                            float(px), float(py),
-                            None,
-                        ))
-                    except Exception as exc:
-                        raw.append((
-                            float(sky.ra.deg), float(sky.dec.deg),
-                            None, None, None, None, str(exc),
-                        ))
+            # Pre-serialise the WCS header once; _extract_cutout rebuilds a
+            # per-cutout WCS from this header (faster than deepcopy).
+            wcs_header = image_wcs.to_header(relax=True)
 
-                # ── Process batch ─────────────────────────────────────────
-                if n_jobs == 1:
-                    for ra, dec, cutout_data, cutout_wcs, px_col, px_row, error in raw:
-                        if error is not None:
-                            entries.append(CatalogueEntry(
-                                ra=ra, dec=dec, cutout=None, result=None, error=error,
+            with tqdm(total=n_total, desc="Detecting spikes") as pbar:
+                for batch_start in range(0, n_total, batch_size):
+                    batch_end = min(batch_start + batch_size, n_total)
+                    batch_coords = coords[batch_start:batch_end]
+                    batch_sizes = sizes[batch_start:batch_end]
+                    batch_px = all_px[batch_start:batch_end]
+                    batch_py = all_py[batch_start:batch_end]
+
+                    # ── Extract batch cutouts ─────────────────────────────
+                    # raw items: (ra, dec, cutout_data, cutout_wcs, px_col, px_row, error)
+                    raw = []
+                    for sky, size, px, py in zip(
+                        batch_coords, batch_sizes, batch_px, batch_py
+                    ):
+                        try:
+                            cutout, cwcs = _extract_cutout(
+                                data, px, py, size, wcs_header,
+                            )
+                            raw.append((
+                                float(sky.ra.deg), float(sky.dec.deg),
+                                cutout, cwcs,
+                                float(px), float(py),
+                                None,
                             ))
-                        else:
-                            try:
-                                result, hmask, hradius = _run_one(cutout_data)
-                                if measure_lengths:
-                                    _apply_lengths(cutout_data, result, px_col, px_row)
-                                entries.append(_build_entry(
-                                    ra, dec, cutout_data, cutout_wcs,
-                                    result, hmask, hradius,
-                                ))
-                            except Exception as exc:
+                        except Exception as exc:
+                            raw.append((
+                                float(sky.ra.deg), float(sky.dec.deg),
+                                None, None, None, None, str(exc),
+                            ))
+
+                    # ── Process batch ─────────────────────────────────────
+                    if _executor is None:
+                        for ra, dec, cutout_data, cutout_wcs, px_col, px_row, error in raw:
+                            if error is not None:
                                 entries.append(CatalogueEntry(
-                                    ra=ra, dec=dec,
-                                    cutout=None if low_memory else cutout_data,
-                                    result=None, error=str(exc), wcs=cutout_wcs,
+                                    ra=ra, dec=dec, cutout=None, result=None, error=error,
                                 ))
-                        pbar.update(1)
-                else:
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            else:
+                                try:
+                                    result, hmask, hradius = _run_one(cutout_data)
+                                    if measure_lengths:
+                                        _apply_lengths(cutout_data, result, px_col, px_row)
+                                    entries.append(_build_entry(
+                                        ra, dec, cutout_data, cutout_wcs,
+                                        result, hmask, hradius,
+                                    ))
+                                except Exception as exc:
+                                    entries.append(CatalogueEntry(
+                                        ra=ra, dec=dec,
+                                        cutout=None if low_memory else cutout_data,
+                                        result=None, error=str(exc), wcs=cutout_wcs,
+                                    ))
+                            pbar.update(1)
+                    else:
                         futures = [
-                            executor.submit(_run_one, cd) if error is None else None
+                            _executor.submit(_run_one, cd) if error is None else None
                             for _, _, cd, _, _, _, error in raw
                         ]
-                    # executor.__exit__ waits for all futures to complete
-
-                    for (ra, dec, cd, cwcs, px_col, px_row, error), future in zip(raw, futures):
-                        if error is not None:
-                            entries.append(CatalogueEntry(
-                                ra=ra, dec=dec, cutout=None, result=None, error=error,
-                            ))
-                        elif future is None:
-                            entries.append(CatalogueEntry(
-                                ra=ra, dec=dec,
-                                cutout=None if low_memory else cd,
-                                result=None, error="cutout extraction failed",
-                            ))
-                        else:
-                            try:
-                                result, hmask, hradius = future.result()
-                                if measure_lengths:
-                                    _apply_lengths(cd, result, px_col, px_row)
-                                entries.append(_build_entry(
-                                    ra, dec, cd, cwcs, result, hmask, hradius,
+                        for (ra, dec, cd, cwcs, px_col, px_row, error), future in zip(
+                            raw, futures
+                        ):
+                            if error is not None:
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec, cutout=None, result=None, error=error,
                                 ))
-                            except Exception as exc:
+                            elif future is None:
                                 entries.append(CatalogueEntry(
                                     ra=ra, dec=dec,
                                     cutout=None if low_memory else cd,
-                                    result=None, error=str(exc), wcs=cwcs,
+                                    result=None, error="cutout extraction failed",
                                 ))
-                        pbar.update(1)
+                            else:
+                                try:
+                                    result, hmask, hradius = future.result()
+                                    if measure_lengths:
+                                        _apply_lengths(cd, result, px_col, px_row)
+                                    entries.append(_build_entry(
+                                        ra, dec, cd, cwcs, result, hmask, hradius,
+                                    ))
+                                except Exception as exc:
+                                    entries.append(CatalogueEntry(
+                                        ra=ra, dec=dec,
+                                        cutout=None if low_memory else cd,
+                                        result=None, error=str(exc), wcs=cwcs,
+                                    ))
+                            pbar.update(1)
 
-                del raw  # free this batch's cutout arrays before the next batch
+                    del raw  # free this batch's cutout arrays before the next batch
+    finally:
+        if _executor is not None:
+            _executor.shutdown(wait=True)
 
     return entries
 
@@ -366,7 +446,6 @@ def catalogue_halo(
     try:
         from astropy.io import fits
         from astropy.wcs import WCS
-        from astropy.nddata import Cutout2D
         from astropy.coordinates import SkyCoord
     except ImportError:
         raise ImportError(
@@ -404,90 +483,102 @@ def catalogue_halo(
     if n_jobs != 1:
         from concurrent.futures import ThreadPoolExecutor
         max_workers = None if n_jobs == -1 else n_jobs
+        _executor = ThreadPoolExecutor(max_workers=max_workers)
+    else:
+        _executor = None
 
-    with fits.open(image_path, memmap=True) as hdul:
-        hdu = hdul[hdu_index]
-        image_wcs = WCS(hdu.header)
-        data = hdu.data
+    try:
+        with fits.open(image_path, memmap=True) as hdul:
+            hdu = hdul[hdu_index]
+            image_wcs = WCS(hdu.header)
+            data = hdu.data
 
-        with tqdm(total=n_total, desc="Measuring halos") as pbar:
-            for batch_start in range(0, n_total, batch_size):
-                batch_end = min(batch_start + batch_size, n_total)
-                batch_coords = coords[batch_start:batch_end]
-                batch_sizes = sizes[batch_start:batch_end]
+            # Vectorised sky→pixel for all coords in one WCS call.
+            all_px, all_py = image_wcs.world_to_pixel(coords)
 
-                # ── Extract batch cutouts ─────────────────────────────────
-                raw = []
-                for sky, size in zip(batch_coords, batch_sizes):
-                    try:
-                        co = Cutout2D(
-                            data, sky, size, wcs=image_wcs,
-                            mode='partial', fill_value=np.nan,
-                            copy=True,
-                        )
-                        raw.append((
-                            float(sky.ra.deg), float(sky.dec.deg),
-                            co.data.astype(float), co.wcs, None,
-                        ))
-                    except Exception as exc:
-                        raw.append((
-                            float(sky.ra.deg), float(sky.dec.deg),
-                            None, None, str(exc),
-                        ))
+            # Pre-serialise WCS header for cheap per-cutout reconstruction.
+            wcs_header = image_wcs.to_header(relax=True)
 
-                # ── Process batch ─────────────────────────────────────────
-                if n_jobs == 1:
-                    for ra, dec, cutout_data, cutout_wcs, error in raw:
-                        if error is not None:
-                            entries.append(CatalogueEntry(
-                                ra=ra, dec=dec, cutout=None, result=None, error=error,
+            with tqdm(total=n_total, desc="Measuring halos") as pbar:
+                for batch_start in range(0, n_total, batch_size):
+                    batch_end = min(batch_start + batch_size, n_total)
+                    batch_coords = coords[batch_start:batch_end]
+                    batch_sizes = sizes[batch_start:batch_end]
+                    batch_px = all_px[batch_start:batch_end]
+                    batch_py = all_py[batch_start:batch_end]
+
+                    # ── Extract batch cutouts ─────────────────────────────
+                    raw = []
+                    for sky, size, px, py in zip(
+                        batch_coords, batch_sizes, batch_px, batch_py
+                    ):
+                        try:
+                            cutout, cwcs = _extract_cutout(
+                                data, px, py, size, wcs_header,
+                            )
+                            raw.append((
+                                float(sky.ra.deg), float(sky.dec.deg),
+                                cutout, cwcs, None,
                             ))
-                        else:
-                            try:
-                                hmask, hradius = _run_one(cutout_data)
+                        except Exception as exc:
+                            raw.append((
+                                float(sky.ra.deg), float(sky.dec.deg),
+                                None, None, str(exc),
+                            ))
+
+                    # ── Process batch ─────────────────────────────────────
+                    if _executor is None:
+                        for ra, dec, cutout_data, cutout_wcs, error in raw:
+                            if error is not None:
                                 entries.append(CatalogueEntry(
-                                    ra=ra, dec=dec, cutout=cutout_data, result=None,
-                                    wcs=cutout_wcs, halo_mask=hmask, halo_radius=hradius,
+                                    ra=ra, dec=dec, cutout=None, result=None, error=error,
                                 ))
-                            except Exception as exc:
-                                entries.append(CatalogueEntry(
-                                    ra=ra, dec=dec, cutout=cutout_data, result=None,
-                                    error=str(exc), wcs=cutout_wcs,
-                                ))
-                        pbar.update(1)
-                else:
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            else:
+                                try:
+                                    hmask, hradius = _run_one(cutout_data)
+                                    entries.append(CatalogueEntry(
+                                        ra=ra, dec=dec, cutout=cutout_data, result=None,
+                                        wcs=cutout_wcs, halo_mask=hmask, halo_radius=hradius,
+                                    ))
+                                except Exception as exc:
+                                    entries.append(CatalogueEntry(
+                                        ra=ra, dec=dec, cutout=cutout_data, result=None,
+                                        error=str(exc), wcs=cutout_wcs,
+                                    ))
+                            pbar.update(1)
+                    else:
                         futures = [
-                            executor.submit(_run_one, cd) if error is None else None
+                            _executor.submit(_run_one, cd) if error is None else None
                             for _, _, cd, _, error in raw
                         ]
-                    # executor.__exit__ waits for all futures to complete
-
-                    for (ra, dec, cd, cwcs, error), future in zip(raw, futures):
-                        if error is not None:
-                            entries.append(CatalogueEntry(
-                                ra=ra, dec=dec, cutout=None, result=None, error=error,
-                            ))
-                        elif future is None:
-                            entries.append(CatalogueEntry(
-                                ra=ra, dec=dec, cutout=cd, result=None,
-                                error="cutout extraction failed",
-                            ))
-                        else:
-                            try:
-                                hmask, hradius = future.result()
+                        for (ra, dec, cd, cwcs, error), future in zip(raw, futures):
+                            if error is not None:
+                                entries.append(CatalogueEntry(
+                                    ra=ra, dec=dec, cutout=None, result=None, error=error,
+                                ))
+                            elif future is None:
                                 entries.append(CatalogueEntry(
                                     ra=ra, dec=dec, cutout=cd, result=None,
-                                    wcs=cwcs, halo_mask=hmask, halo_radius=hradius,
+                                    error="cutout extraction failed",
                                 ))
-                            except Exception as exc:
-                                entries.append(CatalogueEntry(
-                                    ra=ra, dec=dec, cutout=cd, result=None,
-                                    error=str(exc), wcs=cwcs,
-                                ))
-                        pbar.update(1)
+                            else:
+                                try:
+                                    hmask, hradius = future.result()
+                                    entries.append(CatalogueEntry(
+                                        ra=ra, dec=dec, cutout=cd, result=None,
+                                        wcs=cwcs, halo_mask=hmask, halo_radius=hradius,
+                                    ))
+                                except Exception as exc:
+                                    entries.append(CatalogueEntry(
+                                        ra=ra, dec=dec, cutout=cd, result=None,
+                                        error=str(exc), wcs=cwcs,
+                                    ))
+                            pbar.update(1)
 
-                del raw  # free this batch's cutout arrays before the next batch
+                    del raw  # free this batch's cutout arrays before the next batch
+    finally:
+        if _executor is not None:
+            _executor.shutdown(wait=True)
 
     return entries
 
