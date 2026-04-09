@@ -408,6 +408,7 @@ def catalogue_halo(
     n_jobs=1,
     halo_mask_kw=None,
     batch_size=500,
+    low_memory=False,
 ) -> List["CatalogueEntry"]:
     """Run halo masking only over a list of sky positions.
 
@@ -438,6 +439,12 @@ def catalogue_halo(
     batch_size : int
         Number of sources to extract and process at a time.  Larger batches
         are faster (less overhead) but use more RAM.  Default 500.
+    low_memory : bool
+        If *True*, ``cutout`` and ``halo_mask`` arrays are discarded after
+        processing each batch; only ``halo_radius`` and ``wcs`` are kept in
+        the returned entries.  Recommended for large catalogues to prevent
+        OOM — ``halo_radius`` alone is sufficient to write circular mask
+        regions.  Default *False*.
 
     Returns
     -------
@@ -537,13 +544,17 @@ def catalogue_halo(
                                 try:
                                     hmask, hradius = _run_one(cutout_data)
                                     entries.append(CatalogueEntry(
-                                        ra=ra, dec=dec, cutout=cutout_data, result=None,
-                                        wcs=cutout_wcs, halo_mask=hmask, halo_radius=hradius,
+                                        ra=ra, dec=dec,
+                                        cutout=None if low_memory else cutout_data,
+                                        result=None, wcs=cutout_wcs,
+                                        halo_mask=None if low_memory else hmask,
+                                        halo_radius=hradius,
                                     ))
                                 except Exception as exc:
                                     entries.append(CatalogueEntry(
-                                        ra=ra, dec=dec, cutout=cutout_data, result=None,
-                                        error=str(exc), wcs=cutout_wcs,
+                                        ra=ra, dec=dec,
+                                        cutout=None if low_memory else cutout_data,
+                                        result=None, error=str(exc), wcs=cutout_wcs,
                                     ))
                             pbar.update(1)
                     else:
@@ -558,22 +569,29 @@ def catalogue_halo(
                                 ))
                             elif future is None:
                                 entries.append(CatalogueEntry(
-                                    ra=ra, dec=dec, cutout=cd, result=None,
+                                    ra=ra, dec=dec, cutout=None, result=None,
                                     error="cutout extraction failed",
                                 ))
                             else:
                                 try:
                                     hmask, hradius = future.result()
                                     entries.append(CatalogueEntry(
-                                        ra=ra, dec=dec, cutout=cd, result=None,
-                                        wcs=cwcs, halo_mask=hmask, halo_radius=hradius,
+                                        ra=ra, dec=dec,
+                                        cutout=None if low_memory else cd,
+                                        result=None, wcs=cwcs,
+                                        halo_mask=None if low_memory else hmask,
+                                        halo_radius=hradius,
                                     ))
                                 except Exception as exc:
                                     entries.append(CatalogueEntry(
-                                        ra=ra, dec=dec, cutout=cd, result=None,
-                                        error=str(exc), wcs=cwcs,
+                                        ra=ra, dec=dec,
+                                        cutout=None if low_memory else cd,
+                                        result=None, error=str(exc), wcs=cwcs,
                                     ))
                             pbar.update(1)
+                        # futures holds Future objects whose results include hmask
+                        # arrays — delete before del raw so they're freed together.
+                        del futures
 
                     del raw  # free this batch's cutout arrays before the next batch
     finally:
