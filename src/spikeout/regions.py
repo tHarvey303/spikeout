@@ -651,14 +651,29 @@ def write_spike_mask_fits(
         px, py = full_wcs.world_to_pixel(sky)
         cx, cy = float(px), float(py)   # col (x), row (y)
 
+        # When recenter_for_lengths was used, arm lengths (and the halo) are
+        # measured from corrected_centre, not the cutout image centre.
+        # star_centre_offset = (dx, dy) is in the Radon y-up pixel frame:
+        #   dx > 0 → star is dx px to the right (col)
+        #   dy > 0 → star is dy px upward (North; cy increases northward here)
+        result = entry.result
+        if (
+            result is not None
+            and getattr(result, 'corrected_centre', None) is not None
+            and getattr(result, 'star_centre_offset', None) is not None
+        ):
+            dx, dy = result.star_centre_offset
+            cx += dx
+            cy += dy
+
         # Halo circle (independent of lengths being populated)
         if entry.halo_radius is not None and entry.halo_radius > 0:
             circles.append((cx, cy, float(entry.halo_radius)))
 
-        if entry.result is None or entry.result.lengths is None:
+        if result is None or result.lengths is None:
             continue
 
-        for sl in entry.result.lengths:
+        for sl in result.lengths:
             angle_rad = np.deg2rad(sl.angle_deg)
             cos_a = np.cos(angle_rad)
             sin_a = np.sin(angle_rad)
