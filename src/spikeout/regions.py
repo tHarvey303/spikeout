@@ -125,6 +125,37 @@ def _sky_pa(display_angle_deg):
     return pa
 
 
+def _offset_sky(ra0_deg, dec0_deg, d_east_arcsec, d_north_arcsec):
+    """Exact (ra, dec) for a point offset from (ra0, dec0).
+
+    Uses the gnomonic inverse projection, which is valid at any separation
+    and has no 1/cos(dec) singularity near the poles.
+
+    Parameters
+    ----------
+    ra0_deg, dec0_deg : float
+        Reference sky position (degrees).
+    d_east_arcsec : float
+        Offset East (+) / West (−) in arcseconds.
+    d_north_arcsec : float
+        Offset North (+) / South (−) in arcseconds.
+
+    Returns
+    -------
+    ra_deg, dec_deg : float
+    """
+    ra0 = np.deg2rad(ra0_deg)
+    dec0 = np.deg2rad(dec0_deg)
+    xi = np.deg2rad(d_east_arcsec / 3600.0)
+    eta = np.deg2rad(d_north_arcsec / 3600.0)
+    new_ra = ra0 + np.arctan2(xi, np.cos(dec0) - eta * np.sin(dec0))
+    new_dec = np.arctan2(
+        np.sin(dec0) + eta * np.cos(dec0),
+        np.sqrt(xi ** 2 + (np.cos(dec0) - eta * np.sin(dec0)) ** 2),
+    )
+    return np.rad2deg(new_ra), np.rad2deg(new_dec)
+
+
 def spike_box_regions(
     result,
     image_shape,
@@ -299,27 +330,41 @@ def write_catalogue_ds9_regions(
         if entry.result is None or entry.result.lengths is None:
             if verbose:
                 print(f"Warning: entry {entry} has result.lengths = None; skipping")
-            if entry.result is not None and entry.result.lengths is None:
-                if verbose:
-                    print(f"Warning: entry {entry} has result.lengths = None; skipping")
             continue
 
-        dec_rad = np.deg2rad(entry.dec)
+        result = entry.result
 
-        for sl in entry.result.lengths:
+        # Base sky position for arm measurement.  When recenter_for_lengths was
+        # used, arm lengths are measured from corrected_centre (which may differ
+        # from the image centre).  star_centre_offset = (dx, dy) gives the
+        # Radon-derived pixel offset of the detected star from the image centre:
+        #   dx > 0 → star is dx px West of image centre  → d_east = −dx × scale
+        #   dy > 0 → star is dy px North of image centre → d_north = +dy × scale
+        # The image centre corresponds to entry.ra / entry.dec (catalogue pos).
+        if (
+            getattr(result, 'corrected_centre', None) is not None
+            and getattr(result, 'star_centre_offset', None) is not None
+        ):
+            dx, dy = result.star_centre_offset
+            base_ra, base_dec = _offset_sky(
+                entry.ra, entry.dec,
+                -dx * scale, dy * scale,
+            )
+        else:
+            base_ra, base_dec = entry.ra, entry.dec
+
+        for sl in result.lengths:
             angle_rad = np.deg2rad(sl.angle_deg)
             cos_a = np.cos(angle_rad)
             sin_a = np.sin(angle_rad)
 
-            # Offset from star centre to box centre (asymmetric arms)
+            # Pixel offset from star centre to box centre (asymmetric arms).
+            # Display frame: +x = West = −East, +y = North.
             offset_px = (sl.length_pos - sl.length_neg) / 2.0
+            d_east_arcsec = -offset_px * cos_a * scale
+            d_north_arcsec = offset_px * sin_a * scale
 
-            # Display frame: +x = West (East-left), +y = North
-            d_dec_deg = offset_px * sin_a * scale / 3600.0
-            d_ra_deg = -offset_px * cos_a * scale / (3600.0 * np.cos(dec_rad))
-
-            cen_ra = entry.ra + d_ra_deg
-            cen_dec = entry.dec + d_dec_deg
+            cen_ra, cen_dec = _offset_sky(base_ra, base_dec, d_east_arcsec, d_north_arcsec)
 
             box_len_arcsec = sl.length_total * scale
             box_wid_arcsec = _box_width(
@@ -337,7 +382,7 @@ def write_catalogue_ds9_regions(
                 f'{sky_pa:.2f})'
             )
 
-    # if we have halo measurements, add a circle region for the halo aperture
+    # Halo aperture circles
     for entry in entries:
         if entry.halo_radius is None:
             continue
