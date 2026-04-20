@@ -798,12 +798,26 @@ def halo_mask(
     smooth_bins=5,
     override_threshold=None,
     radius_factor=1.0,
+    n_sectors=8,
+    min_sector_pixels=5,
+    sector_sigma_clip=2.0,
 ):
     """Boolean circular mask enclosing the stellar halo.
 
-    Builds a robust azimuthal-median radial profile (immune to diffraction
-    spikes and neighbouring sources) and finds the outermost radius at which
-    the profile exceeds a background-noise threshold.
+    Builds a robust radial profile using per-sector medians with outlier
+    rejection, then finds the outermost radius at which the profile exceeds
+    a background-noise threshold.
+
+    At each radial bin the annulus is divided into ``n_sectors`` angular
+    wedges.  The median flux is computed per sector; sectors with too few
+    pixels (``< min_sector_pixels``) are skipped.  Outlier sectors —
+    those whose median lies more than ``sector_sigma_clip × MAD`` above
+    the sector-median distribution — are rejected before the per-bin
+    representative value is taken as the median of the surviving sector
+    medians.  This makes the profile immune to neighbouring sources, which
+    inflate only a small number of sectors.  When fewer than 2 sectors
+    survive at a given bin, the function falls back to the plain
+    per-annulus median so the profile remains defined.
 
     The threshold is ``background_level + threshold_nsigma × σ_MAD``, where
     both quantities are estimated from an outer annulus of the image using
@@ -839,8 +853,8 @@ def halo_mask(
     smooth_bins : int
         Window size (in bins) for a 1-D median filter applied to the
         radial profile before thresholding.  Suppresses single-bin
-        excursions from noise or a neighbour source occupying a small
-        fraction of an annulus.  Default 5.
+        excursions from noise without blurring the broad radial gradient.
+        Default 5.
     override_threshold : float or None
         If not *None*, use this fixed threshold value instead of estimating
         from the image.  Useful when the image is too small to get a good
@@ -849,6 +863,19 @@ def halo_mask(
         Optional multiplicative factor applied to the measured halo radius.
         Default 1.0 (no scaling).  Increase to be more conservative in
         masking the halo, at the cost of masking more pixels.
+    n_sectors : int
+        Number of equal angular sectors to divide each annulus into.
+        Higher values give finer angular resolution for neighbour rejection
+        but reduce the number of pixels per sector.  Default 8.
+    min_sector_pixels : int
+        Minimum number of finite pixels a sector must contain to be included
+        in the per-bin median.  Sectors below this count are skipped.
+        Acts as the guard at small radii where annuli are narrow.  Default 5.
+    sector_sigma_clip : float
+        Sectors whose median exceeds the median-of-sector-medians by more
+        than ``sector_sigma_clip × MAD`` are rejected as contaminated
+        (e.g. by a neighbouring source).  Set to a large value (e.g. 10)
+        to disable outlier rejection.  Default 2.0.
 
     Returns
     -------
@@ -856,14 +883,6 @@ def halo_mask(
         True inside the halo aperture.
     radius_px : float
         The measured halo radius in pixels.
-
-    Notes
-    -----
-    The azimuthal median is computed independently at each radial bin, so
-    a neighbouring source affects only bins where it occupies more than
-    half the annulus area — typically none for sources well separated from
-    the target.  For sources very close to the target, increase
-    *threshold_nsigma* or provide a custom *centre*.
     """
     from scipy.ndimage import median_filter as _median_filter
 
@@ -877,15 +896,14 @@ def halo_mask(
 
     Y, X = np.mgrid[:nrows, :ncols]
     R = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    # Angle in [0, 2π) for each pixel, used for sector assignment.
+    Theta = np.arctan2(Y - cy, X - cx) % (2.0 * np.pi)
 
     if max_radius is None:
         max_radius = float(min(cy, cx, nrows - cy, ncols - cx))
     max_radius = max(max_radius, min_radius + 1.0)
 
     # ── Background estimation ─────────────────────────────────────────────
-    # Use sep-based estimator (masks halo + neighbouring sources) when
-    # available; falls back to pixel-to-pixel MAD otherwise.
-
     if not override_threshold:
         bg_inner = background_min_r_frac * max_radius
         bg_level, bg_sigma = estimate_background(img, cy, cx, bg_inner)
@@ -894,38 +912,60 @@ def halo_mask(
         threshold = override_threshold
         bg_level = 0
 
-    # ── Azimuthal-median radial profile ───────────────────────────────────
-    # Median per concentric annulus; a single-source neighbour biases the
-    # result only when it covers > 50 % of the annulus — very unlikely for
-    # r much larger than the neighbour's PSF.
+    # ── Sector-median radial profile with outlier rejection ───────────────
     bins = np.arange(0.0, max_radius + radial_bin_width, radial_bin_width)
     n_bins = len(bins) - 1
     r_centers = 0.5 * (bins[:-1] + bins[1:])
 
     r_flat = R.ravel()
+    t_flat = Theta.ravel()
     img_flat = img.ravel()
     finite_flat = np.isfinite(img_flat)
 
-    # Initialise profile to bg_level so empty/sparse bins don't trigger a
-    # spurious detection.
+    sector_edges = np.linspace(0.0, 2.0 * np.pi, n_sectors + 1)
+
     profile = np.full(n_bins, bg_level)
     for i in range(n_bins):
         in_bin = (r_flat >= bins[i]) & (r_flat < bins[i + 1]) & finite_flat
-        if in_bin.sum() >= 3:
-            profile[i] = float(np.median(img_flat[in_bin]))
+        if not in_bin.any():
+            continue
+
+        # Compute median per sector; skip sectors below the pixel guard.
+        sector_medians = []
+        for s in range(n_sectors):
+            in_sector = in_bin & (t_flat >= sector_edges[s]) & (t_flat < sector_edges[s + 1])
+            if in_sector.sum() >= min_sector_pixels:
+                sector_medians.append(float(np.median(img_flat[in_sector])))
+
+        if len(sector_medians) < 2:
+            # Too few valid sectors — fall back to plain annulus median.
+            n_all = in_bin.sum()
+            if n_all >= 3:
+                profile[i] = float(np.median(img_flat[in_bin]))
+            continue
+
+        sm = np.array(sector_medians)
+
+        # Reject outlier sectors caused by neighbouring sources.
+        if sector_sigma_clip < 10.0 and len(sm) >= 3:
+            centre_val = float(np.median(sm))
+            spread = mad_std(sm)
+            if spread > 0:
+                keep = sm <= centre_val + sector_sigma_clip * spread
+                sm = sm[keep]
+
+        if len(sm) == 0:
+            sm = np.array(sector_medians)  # all rejected — use all
+
+        profile[i] = float(np.median(sm))
 
     # ── Smooth profile ────────────────────────────────────────────────────
-    # 1-D median filter kills single-bin spikes from noise or a bright
-    # neighbour crossing one annulus, without blurring the broad radial
-    # gradient that carries the halo extent information.
     if smooth_bins > 1 and n_bins >= smooth_bins:
         profile_s = _median_filter(profile, size=smooth_bins, mode='nearest')
     else:
         profile_s = profile.copy()
 
     # ── Find halo radius ──────────────────────────────────────────────────
-    # Walk outward; keep updating halo_r as long as the profile is above
-    # threshold.  The last update gives the outermost extent of the halo.
     halo_r = float(min_radius)
     for i in range(n_bins):
         if profile_s[i] >= threshold:
