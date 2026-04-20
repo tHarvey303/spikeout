@@ -142,6 +142,7 @@ def catalogue_detect(
     full_array=None,
     measure_lengths=False,
     length_kw=None,
+    drop_halo_spikes=False,
     low_memory=False,
     batch_size=500,
     **detect_kw,
@@ -186,6 +187,13 @@ def catalogue_detect(
     length_kw : dict or *None*
         Extra keyword arguments forwarded to
         `~spikeout.lengths.measure_spike_lengths`.
+    drop_halo_spikes : bool
+        If *True*, call `~spikeout.detect.SpikeResult.drop_within_halo`
+        on each result after lengths are measured, removing any spike
+        whose longest arm does not extend beyond the halo radius.
+        Requires both ``measure_lengths=True`` and ``halo_mask_kw`` to
+        be set; silently skipped for any entry where either condition is
+        not met.  Default *False*.
     low_memory : bool
         If *True*, large intermediate arrays (sinogram, prepared image,
         swath profiles, radii arrays, background profiles, per-source
@@ -347,6 +355,10 @@ def catalogue_detect(
                                     result, hmask, hradius = _run_one(cutout_data)
                                     if measure_lengths:
                                         _apply_lengths(cutout_data, result, px_col, px_row)
+                                    if (drop_halo_spikes and hradius is not None
+                                            and result is not None
+                                            and result.lengths is not None):
+                                        result = result.drop_within_halo(hradius)
                                     entries.append(_build_entry(
                                         ra, dec, cutout_data, cutout_wcs,
                                         result, hmask, hradius,
@@ -381,6 +393,10 @@ def catalogue_detect(
                                     result, hmask, hradius = future.result()
                                     if measure_lengths:
                                         _apply_lengths(cd, result, px_col, px_row)
+                                    if (drop_halo_spikes and hradius is not None
+                                            and result is not None
+                                            and result.lengths is not None):
+                                        result = result.drop_within_halo(hradius)
                                     entries.append(_build_entry(
                                         ra, dec, cd, cwcs, result, hmask, hradius,
                                     ))

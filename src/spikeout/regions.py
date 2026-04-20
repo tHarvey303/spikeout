@@ -1,5 +1,6 @@
 """DS9 region file generation and pixel masks for diffraction spikes and halos."""
 
+import re
 import numpy as np
 from .stats import mad_std, estimate_background
 
@@ -10,6 +11,8 @@ __all__ = [
     "write_border_mask_fits",
     "write_ds9_regions",
     "write_catalogue_ds9_regions",
+    "read_ds9_regions",
+    "read_catalogue_ds9_regions",
     "halo_mask",
     "compress_fits_mask_to_bytes",
     "decompress_bytes_to_fits_mask",
@@ -125,6 +128,17 @@ def _sky_pa(display_angle_deg):
     return pa
 
 
+def _sky_pa_inverse(sky_pa_deg, image_pa_deg=0.0):
+    """Inverse of :func:`_sky_pa`: recover display-frame angle in [0, 180) from sky PA.
+
+    The result is ambiguous by 180° (same as the forward function); the
+    caller must use the box-centre offset direction to resolve the full
+    0–360° angle.
+    """
+    pa_rad = np.deg2rad((sky_pa_deg - image_pa_deg) % 180.0)
+    return float(np.degrees(np.arctan2(np.cos(pa_rad), -np.sin(pa_rad))) % 180.0)
+
+
 def _offset_sky(ra0_deg, dec0_deg, d_east_arcsec, d_north_arcsec):
     """Exact (ra, dec) for a point offset from (ra0, dec0).
 
@@ -154,6 +168,24 @@ def _offset_sky(ra0_deg, dec0_deg, d_east_arcsec, d_north_arcsec):
         np.sqrt(xi ** 2 + (np.cos(dec0) - eta * np.sin(dec0)) ** 2),
     )
     return np.rad2deg(new_ra), np.rad2deg(new_dec)
+
+
+def _sky_offset(ra0_deg, dec0_deg, ra1_deg, dec1_deg):
+    """Exact tangent-plane offsets from (ra0, dec0) to (ra1, dec1).
+
+    Gnomonic forward projection — inverse of :func:`_offset_sky`.
+
+    Returns
+    -------
+    d_east_arcsec, d_north_arcsec : float
+    """
+    ra0 = np.deg2rad(ra0_deg);  dec0 = np.deg2rad(dec0_deg)
+    ra1 = np.deg2rad(ra1_deg);  dec1 = np.deg2rad(dec1_deg)
+    dra = ra1 - ra0
+    D = np.sin(dec0) * np.sin(dec1) + np.cos(dec0) * np.cos(dec1) * np.cos(dra)
+    xi  = np.cos(dec1) * np.sin(dra) / D
+    eta = (np.cos(dec0) * np.sin(dec1) - np.sin(dec0) * np.cos(dec1) * np.cos(dra)) / D
+    return np.rad2deg(xi) * 3600.0, np.rad2deg(eta) * 3600.0
 
 
 def spike_box_regions(
@@ -393,6 +425,366 @@ def write_catalogue_ds9_regions(
         )
 
     _write_reg_file(path, "fk5", regions, colour)
+
+
+# ---------------------------------------------------------------------------
+# Region file parsing (inverse of the write functions above)
+# ---------------------------------------------------------------------------
+
+_BOX_RE = re.compile(
+    r'^box\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^,"]+?)\s*"?\s*,'
+    r'\s*([^,"]+?)\s*"?\s*,\s*([^)]+?)\s*\)$',
+    re.IGNORECASE,
+)
+_CIRC_RE = re.compile(
+    r'^circle\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^)"]+?)\s*"?\s*\)$',
+    re.IGNORECASE,
+)
+_COORDSYS_TOKENS = frozenset(
+    ('image', 'fk5', 'fk4', 'j2000', 'b1950', 'icrs', 'galactic', 'ecliptic')
+)
+
+
+def _detect_coordsys(lines):
+    """Return the coordinate-system token from a DS9 region file header."""
+    for line in lines:
+        s = line.strip().lower()
+        if s in _COORDSYS_TOKENS:
+            return s
+    return None
+
+
+def _make_spike_lengths(display_angle_0_180, length_total, swath_width, box_offset_px):
+    """Reconstruct a SpikeLengths from a box geometry.
+
+    Parameters
+    ----------
+    display_angle_0_180 : float
+        Display-frame box angle in [0, 180) — the 180° ambiguity stored in
+        the region file.
+    length_total : float
+        Total spike length in pixels (box height).
+    swath_width : float
+        Swath width in pixels (box width).
+    box_offset_px : float
+        Signed offset of the box centre from the star centre projected along
+        ``display_angle_0_180``.  Positive → box shifted toward that angle;
+        negative → shifted toward the opposite direction.
+
+    Returns
+    -------
+    SpikeLengths
+    """
+    from .lengths import SpikeLengths
+
+    # Resolve 180° ambiguity: positive arm is in the direction of positive offset
+    if box_offset_px >= 0:
+        angle_deg = float(display_angle_0_180 % 360.0)
+    else:
+        angle_deg = float((display_angle_0_180 + 180.0) % 360.0)
+        box_offset_px = -box_offset_px
+
+    length_pos = max(0.0, length_total / 2.0 + box_offset_px)
+    length_neg = max(0.0, length_total / 2.0 - box_offset_px)
+    _e = np.array([], dtype=np.float64)
+    return SpikeLengths(
+        angle_deg=angle_deg,
+        length_pos=length_pos,
+        length_neg=length_neg,
+        length_total=length_total,
+        profile_pos=_e, profile_neg=_e,
+        radii_pos=_e, radii_neg=_e,
+        converged_pos=True, converged_neg=True,
+        popt=None,
+        threshold=np.nan,
+        background_profile=None,
+        swath_width=swath_width,
+    )
+
+
+def read_ds9_regions(path, image, centre=None):
+    """Read an image-coordinate DS9 region file and reconstruct spike measurements.
+
+    Reverses the output of :func:`write_ds9_regions`: parses each ``box``
+    region back into a :class:`~spikeout.lengths.SpikeLengths` and assembles
+    a partial :class:`~spikeout.detect.SpikeResult`.
+
+    Fields that cannot be recovered from the region file (``sinogram``,
+    ``snr``, ``prepared_image``, profile arrays, etc.) are set to *None*
+    or filled with *NaN* / zeros as appropriate.
+
+    Parameters
+    ----------
+    path : str or path-like
+        DS9 region file written by :func:`write_ds9_regions` (image coords).
+    image : 2-D array
+        Original image — only its shape is used to set the default star centre.
+    centre : (row, col) or None
+        Star centre in 0-indexed pixel coordinates.  Defaults to the image
+        centre.
+
+    Returns
+    -------
+    SpikeResult
+        Partial result with ``angles`` and ``lengths`` populated.
+
+    Raises
+    ------
+    ValueError
+        If the file does not declare image coordinates.
+    """
+    from .detect import SpikeResult
+
+    image = np.asarray(image, dtype=float)
+    nrows, ncols = image.shape
+    if centre is None:
+        cy, cx = nrows / 2.0, ncols / 2.0
+    else:
+        cy, cx = float(centre[0]), float(centre[1])
+
+    with open(path) as fh:
+        lines = [l.rstrip('\n') for l in fh]
+
+    coordsys = _detect_coordsys(lines)
+    if coordsys != 'image':
+        raise ValueError(
+            f"Expected image-coordinate region file (coordinate system 'image'), "
+            f"got {coordsys!r}.  For sky-coordinate files use read_catalogue_ds9_regions."
+        )
+
+    lengths = []
+    angles_list = []
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = _BOX_RE.match(line)
+        if m is None:
+            continue
+
+        ds9_x, ds9_y, box_wid, box_len, ds9_angle = (float(g) for g in m.groups())
+
+        # DS9 image coordinates are 1-indexed; convert to 0-indexed display frame
+        # (origin='lower': row 0 at bottom, y increases upward).
+        bx = ds9_x - 1.0   # col
+        by = ds9_y - 1.0   # row
+
+        angle_rad = np.deg2rad(ds9_angle)
+        # Signed projection of (box_centre − star_centre) onto the box axis.
+        # This recovers (length_pos − length_neg) / 2 with the correct sign.
+        offset_px = (bx - cx) * np.cos(angle_rad) + (by - cy) * np.sin(angle_rad)
+
+        sl = _make_spike_lengths(ds9_angle, box_len, box_wid, offset_px)
+        lengths.append(sl)
+        angles_list.append(sl.angle_deg)
+
+    n = len(angles_list)
+    return SpikeResult(
+        angles=np.array(angles_list),
+        rho_physical=np.zeros(n),
+        snr=np.full(n, np.nan),
+        sinogram=None,
+        theta=None,
+        peak_rho_indices=np.zeros(n, dtype=int),
+        peak_theta_indices=np.zeros(n, dtype=int),
+        prepared_image=None,
+        n_rejected_snr=0,
+        lengths=lengths if lengths else None,
+    )
+
+
+def read_catalogue_ds9_regions(
+    path,
+    entries,
+    pixel_scale_arcsec,
+    image_pa_deg=0.0,
+    match_radius_arcsec=None,
+    verbose=True,
+):
+    """Read a sky-coordinate catalogue DS9 region file and update entries.
+
+    Reverses the output of :func:`write_catalogue_ds9_regions`.  Each ``box``
+    region is matched to the nearest entry by angular separation and the
+    reconstructed :class:`~spikeout.lengths.SpikeLengths` objects are stored
+    in ``entry.result.lengths``.  ``circle`` regions update
+    ``entry.halo_radius``.
+
+    Parameters
+    ----------
+    path : str or path-like
+        DS9 region file written by :func:`write_catalogue_ds9_regions`.
+    entries : list of CatalogueEntry
+        Entries to update in-place.  Matched by nearest sky position.
+    pixel_scale_arcsec : float
+        Pixel scale of the original image (arcseconds per pixel).  Must
+        match the value used when writing the file.
+    image_pa_deg : float
+        Image position angle used when writing the file.  Must match the
+        ``image_pa_deg`` passed to :func:`write_catalogue_ds9_regions`.
+        Default 0.
+    match_radius_arcsec : float or None
+        Maximum angular separation (arcsec) between a region's sky position
+        and the entry it is assigned to.  Defaults to the largest box height
+        in the file (a safe upper bound on the box-centre offset from the
+        star).
+    verbose : bool
+        If *True*, warn about regions that cannot be matched to any entry.
+
+    Returns
+    -------
+    entries : list of CatalogueEntry
+        The same list, with ``result.lengths`` and ``halo_radius`` updated
+        in-place.
+
+    Raises
+    ------
+    ValueError
+        If the file does not declare a recognised sky coordinate system.
+    """
+    from .detect import SpikeResult
+
+    scale = pixel_scale_arcsec
+    _SKY_SYSTEMS = ('fk5', 'fk4', 'j2000', 'b1950', 'icrs')
+
+    with open(path) as fh:
+        lines = [l.rstrip('\n') for l in fh]
+
+    coordsys = _detect_coordsys(lines)
+    if coordsys not in _SKY_SYSTEMS:
+        raise ValueError(
+            f"Expected sky-coordinate region file (e.g. 'fk5'), got {coordsys!r}.  "
+            f"For image-coordinate files use read_ds9_regions."
+        )
+
+    # ── Parse all regions ─────────────────────────────────────────────────
+    raw_boxes = []    # (ra, dec, wid_arcsec, len_arcsec, sky_pa_deg)
+    raw_circles = []  # (ra, dec, radius_arcsec)
+    max_len_arcsec = 0.0
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = _BOX_RE.match(line)
+        if m:
+            ra, dec, wid, length, pa = (float(g) for g in m.groups())
+            raw_boxes.append((ra, dec, wid, length, pa))
+            max_len_arcsec = max(max_len_arcsec, length)
+            continue
+        m = _CIRC_RE.match(line)
+        if m:
+            ra, dec, r = (float(g) for g in m.groups())
+            raw_circles.append((ra, dec, r))
+
+    if match_radius_arcsec is None:
+        match_radius_arcsec = max(max_len_arcsec, 10.0)
+
+    if not entries:
+        return entries
+
+    # Precompute entry sky positions as arrays for vectorised matching
+    ras  = np.deg2rad([e.ra  for e in entries])
+    decs = np.deg2rad([e.dec for e in entries])
+
+    def _nearest(ra_deg, dec_deg):
+        """Index and separation (arcsec) of the nearest entry."""
+        ra_r  = np.deg2rad(ra_deg)
+        dec_r = np.deg2rad(dec_deg)
+        cos_sep = np.clip(
+            np.sin(dec_r) * np.sin(decs) + np.cos(dec_r) * np.cos(decs) * np.cos(ra_r - ras),
+            -1.0, 1.0,
+        )
+        seps = np.degrees(np.arccos(cos_sep)) * 3600.0   # arcsec
+        idx = int(np.argmin(seps))
+        return idx, seps[idx]
+
+    # ── Match and reconstruct SpikeLengths ────────────────────────────────
+    entry_boxes = {i: [] for i in range(len(entries))}
+
+    for ra_b, dec_b, wid_as, len_as, sky_pa in raw_boxes:
+        idx, sep = _nearest(ra_b, dec_b)
+        if sep > match_radius_arcsec:
+            if verbose:
+                print(
+                    f"Warning: box at ({ra_b:.6f}, {dec_b:.6f}) unmatched "
+                    f"(nearest entry {sep:.1f}\" away, threshold {match_radius_arcsec:.1f}\")"
+                )
+            continue
+        entry_boxes[idx].append((ra_b, dec_b, wid_as, len_as, sky_pa))
+
+    for i, entry in enumerate(entries):
+        boxes = entry_boxes[i]
+        if not boxes:
+            continue
+
+        # Use the same base sky position as the writer did
+        result = entry.result
+        if (
+            result is not None
+            and getattr(result, 'corrected_centre', None) is not None
+            and getattr(result, 'star_centre_offset', None) is not None
+        ):
+            dx, dy = result.star_centre_offset
+            base_ra, base_dec = _offset_sky(entry.ra, entry.dec, -dx * scale, dy * scale)
+        else:
+            base_ra, base_dec = entry.ra, entry.dec
+
+        lengths_out = []
+        angles_out = []
+
+        for ra_b, dec_b, wid_as, len_as, sky_pa in boxes:
+            length_total_px = len_as / scale
+            swath_width_px  = wid_as / scale
+
+            # Recover display-frame angle (0-180) from stored sky PA
+            display_angle = _sky_pa_inverse(sky_pa, image_pa_deg)
+            angle_rad = np.deg2rad(display_angle)
+            cos_a = np.cos(angle_rad)
+            sin_a = np.sin(angle_rad)
+
+            # Exact tangent-plane offset from base sky position to box centre.
+            # From the writer: d_east = -offset_px * cos_a * scale
+            #                  d_north = offset_px * sin_a * scale
+            # Inversion via dot product: offset_px = (-d_east * cos_a + d_north * sin_a) / scale
+            d_east_as, d_north_as = _sky_offset(base_ra, base_dec, ra_b, dec_b)
+            offset_px = (-d_east_as * cos_a + d_north_as * sin_a) / scale
+
+            sl = _make_spike_lengths(display_angle, length_total_px, swath_width_px, offset_px)
+            lengths_out.append(sl)
+            angles_out.append(sl.angle_deg)
+
+        if result is not None:
+            result.lengths = lengths_out
+            result.angles = np.array(angles_out)
+        else:
+            n = len(angles_out)
+            entry.result = SpikeResult(
+                angles=np.array(angles_out),
+                rho_physical=np.zeros(n),
+                snr=np.full(n, np.nan),
+                sinogram=None,
+                theta=None,
+                peak_rho_indices=np.zeros(n, dtype=int),
+                peak_theta_indices=np.zeros(n, dtype=int),
+                prepared_image=None,
+                n_rejected_snr=0,
+                lengths=lengths_out,
+            )
+
+    # ── Match circle regions → halo_radius ───────────────────────────────
+    for ra_c, dec_c, r_as in raw_circles:
+        idx, sep = _nearest(ra_c, dec_c)
+        if sep > match_radius_arcsec:
+            if verbose:
+                print(
+                    f"Warning: circle at ({ra_c:.6f}, {dec_c:.6f}) unmatched "
+                    f"(nearest entry {sep:.1f}\" away, threshold {match_radius_arcsec:.1f}\")"
+                )
+            continue
+        entries[idx].halo_radius = r_as / scale
+
+    return entries
 
 
 def halo_mask(

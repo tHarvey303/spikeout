@@ -66,6 +66,58 @@ class SpikeResult:
     ``max_center_offset``.  Passed automatically to ``measure_spike_lengths``
     and stored for downstream use (e.g. ``catalogue_detect``)."""
 
+    def drop_within_halo(self, halo_radius: float) -> "SpikeResult":
+        """Return a new SpikeResult with spikes fully enclosed by the halo removed.
+
+        A spike is considered fully enclosed when both arms lie within
+        *halo_radius* pixels of the star centre, i.e.
+        ``max(length_pos, length_neg) <= halo_radius``.  Requires
+        ``lengths`` to be populated (``measure_lengths=True`` in `detect`).
+
+        Parameters
+        ----------
+        halo_radius : float
+            Halo radius in pixels (e.g. ``CatalogueEntry.halo_radius``).
+
+        Returns
+        -------
+        SpikeResult
+            New result with enclosed spikes removed.  Shared fields
+            (sinogram, theta, prepared_image, etc.) are copied by reference.
+
+        Raises
+        ------
+        ValueError
+            If ``lengths`` is *None* (lengths were not measured).
+        """
+        if self.lengths is None:
+            raise ValueError(
+                "drop_within_halo requires spike lengths to be measured; "
+                "call detect() with measure_lengths=True."
+            )
+        keep = np.array(
+            [
+                i for i, sl in enumerate(self.lengths)
+                if max(sl.length_pos, sl.length_neg) > halo_radius
+            ],
+            dtype=int,
+        )
+        return SpikeResult(
+            angles=self.angles[keep],
+            rho_physical=self.rho_physical[keep],
+            snr=self.snr[keep],
+            sinogram=self.sinogram,
+            theta=self.theta,
+            peak_rho_indices=self.peak_rho_indices[keep],
+            peak_theta_indices=self.peak_theta_indices[keep],
+            prepared_image=self.prepared_image,
+            n_rejected_snr=self.n_rejected_snr,
+            lengths=[self.lengths[i] for i in keep],
+            max_rho_px=self.max_rho_px,
+            star_centre_offset=self.star_centre_offset,
+            corrected_centre=self.corrected_centre,
+        )
+
     def __repr__(self) -> str:
         n = len(self.angles)
         if n == 0:
