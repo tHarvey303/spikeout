@@ -925,39 +925,62 @@ def halo_mask(
     sector_edges = np.linspace(0.0, 2.0 * np.pi, n_sectors + 1)
 
     profile = np.full(n_bins, bg_level)
-    for i in range(n_bins):
-        in_bin = (r_flat >= bins[i]) & (r_flat < bins[i + 1]) & finite_flat
-        if not in_bin.any():
-            continue
 
-        # Compute median per sector; skip sectors below the pixel guard.
-        sector_medians = []
-        for s in range(n_sectors):
-            in_sector = in_bin & (t_flat >= sector_edges[s]) & (t_flat < sector_edges[s + 1])
-            if in_sector.sum() >= min_sector_pixels:
-                sector_medians.append(float(np.median(img_flat[in_sector])))
+    r_bin_all = np.digitize(r_flat, bins) - 1
+    s_bin_all = np.digitize(t_flat, sector_edges) - 1
+    valid = (
+        finite_flat
+        & (r_bin_all >= 0) & (r_bin_all < n_bins)
+        & (s_bin_all >= 0) & (s_bin_all < n_sectors)
+    )
 
-        if len(sector_medians) < 2:
-            # Too few valid sectors — fall back to plain annulus median.
-            n_all = in_bin.sum()
-            if n_all >= 3:
-                profile[i] = float(np.median(img_flat[in_bin]))
-            continue
+    if valid.any():
+        vr = r_bin_all[valid].astype(np.intp)
+        vs = s_bin_all[valid].astype(np.intp)
+        vi = img_flat[valid]
 
-        sm = np.array(sector_medians)
+        group_key = vr * n_sectors + vs
+        order = np.argsort(group_key, kind='stable')
+        gk_sorted = group_key[order]
+        vi_sorted = vi[order]
+        vr_sorted = vr[order]
 
-        # Reject outlier sectors caused by neighbouring sources.
-        if sector_sigma_clip < 10.0 and len(sm) >= 3:
-            centre_val = float(np.median(sm))
-            spread = mad_std(sm)
-            if spread > 0:
-                keep = sm <= centre_val + sector_sigma_clip * spread
-                sm = sm[keep]
+        gs_splits = np.flatnonzero(np.diff(gk_sorted)) + 1
+        gs_groups = np.split(vi_sorted, gs_splits)
+        gs_keys   = gk_sorted[np.r_[0, gs_splits]]
 
-        if len(sm) == 0:
-            sm = np.array(sector_medians)  # all rejected — use all
+        gr_splits = np.flatnonzero(np.diff(vr_sorted)) + 1
+        gr_groups = np.split(vi_sorted, gr_splits)
+        gr_keys   = vr_sorted[np.r_[0, gr_splits]]
+        bin_vals  = {int(k): g for k, g in zip(gr_keys, gr_groups)}
 
-        profile[i] = float(np.median(sm))
+        bin_sector_medians = {i: [] for i in range(n_bins)}
+        for g, k in zip(gs_groups, gs_keys):
+            b = int(k) // n_sectors
+            if len(g) >= min_sector_pixels:
+                bin_sector_medians[b].append(float(np.median(g)))
+
+        for i in range(n_bins):
+            sm_list = bin_sector_medians[i]
+            if len(sm_list) < 2:
+                bv = bin_vals.get(i)
+                if bv is not None and len(bv) >= 3:
+                    profile[i] = float(np.median(bv))
+                continue
+
+            sm = np.array(sm_list)
+
+            if sector_sigma_clip < 10.0 and len(sm) >= 3:
+                centre_val = float(np.median(sm))
+                spread = mad_std(sm)
+                if spread > 0:
+                    keep = sm <= centre_val + sector_sigma_clip * spread
+                    sm = sm[keep]
+
+            if len(sm) == 0:
+                sm = np.array(sm_list)
+
+            profile[i] = float(np.median(sm))
 
     # ── Smooth profile ────────────────────────────────────────────────────
     if smooth_bins > 1 and n_bins >= smooth_bins:
