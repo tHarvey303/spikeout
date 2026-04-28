@@ -7,7 +7,7 @@ from .geometry import radon_line_to_image, sinogram_rho_to_physical, calculate_s
 from .plotting import plot_diagnostics
 from .catalogue import catalogue_detect, catalogue_summary, plot_catalogue, CatalogueEntry, catalogue_halo
 from .stars import fetch_gaia_stars
-from .regions import spike_box_regions, spike_mask, write_ds9_regions, write_catalogue_ds9_regions, halo_mask
+from .regions import spike_box_regions, spike_mask, write_ds9_regions, write_catalogue_ds9_regions, halo_mask, combine_masks, combine_fits_masks
 from .stats import mad_std
 
 __all__ = [
@@ -39,6 +39,8 @@ __all__ = [
     "write_ds9_regions",
     "write_catalogue_ds9_regions",
     "halo_mask",
+    "combine_masks",
+    "combine_fits_masks",
     # stars
     "fetch_gaia_stars",
 ]

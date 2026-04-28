@@ -16,6 +16,8 @@ __all__ = [
     "halo_mask",
     "compress_fits_mask_to_bytes",
     "decompress_bytes_to_fits_mask",
+    "combine_masks",
+    "combine_fits_masks",
 ]
 
 
@@ -1000,6 +1002,182 @@ def halo_mask(
     # ── Build circular mask ───────────────────────────────────────────────
     mask = R <= halo_r
     return mask, halo_r
+
+
+def combine_masks(masks, operation='or'):
+    """Combine multiple boolean pixel masks into one.
+
+    Operates in-place on a copy of the first mask so no extra intermediate
+    arrays are allocated — peak memory is two mask arrays at once regardless
+    of how many inputs are given.
+
+    Parameters
+    ----------
+    masks : sequence of ndarray of bool
+        Masks to combine.  All must have the same shape.
+    operation : {'or', 'and', 'xor'}
+        Pixel-wise logical operation applied sequentially.  'or' (union) is
+        the usual choice for contamination masks: a pixel is masked if it is
+        masked in *any* input.
+
+    Returns
+    -------
+    combined : ndarray of bool
+    """
+    masks = list(masks)
+    if not masks:
+        raise ValueError("at least one mask is required")
+
+    _ops = {
+        'or':  np.ndarray.__ior__,
+        'and': np.ndarray.__iand__,
+        'xor': np.ndarray.__ixor__,
+    }
+    if operation not in _ops:
+        raise ValueError(f"operation must be 'or', 'and', or 'xor'; got {operation!r}")
+    op = _ops[operation]
+
+    result = np.asarray(masks[0], dtype=bool).copy()
+    for m in masks[1:]:
+        m = np.asarray(m, dtype=bool)
+        if m.shape != result.shape:
+            raise ValueError(
+                f"mask shapes are inconsistent: {result.shape} vs {m.shape}"
+            )
+        op(result, m)
+    return result
+
+
+def combine_fits_masks(
+    input_paths,
+    output_path,
+    hdu_indices=None,
+    operation='or',
+    tile_size=4096,
+    n_workers=4,
+):
+    """Combine multiple FITS pixel masks into one using tiled memmap processing.
+
+    Reads each input file tile-by-tile via memory mapping so peak RAM usage
+    is proportional to ``tile_size`` rather than the full image, regardless of
+    how many files are combined.  All input files must share the same pixel
+    dimensions.  The WCS header is taken from the first file.
+
+    Typical use — union of a spike mask and a border mask::
+
+        combine_fits_masks([spike_mask.fits, border_mask.fits], combined.fits)
+
+    Parameters
+    ----------
+    input_paths : sequence of str or path-like
+        FITS mask files to combine.
+    output_path : str or path-like
+        Destination FITS path.  Overwritten if it already exists.
+    hdu_indices : sequence of int or None
+        HDU index for each input file.  *None* defaults to 0 for every file.
+    operation : {'or', 'and'}
+        Pixel-wise operation applied across all inputs.  'or' marks a pixel
+        masked if it is masked in *any* input (union); 'and' only if masked
+        in *all* inputs (intersection).  Default 'or'.
+    tile_size : int
+        Side length of each square processing tile in pixels.  Default 4096.
+    n_workers : int
+        Number of parallel worker threads.  ``-1`` uses all available CPU
+        threads.  Default 4.
+
+    Returns
+    -------
+    None
+        The combined mask is written directly to *output_path*.
+    """
+    try:
+        from astropy.io import fits as _fits
+        from astropy.wcs import WCS as _WCS
+    except ImportError:
+        raise ImportError(
+            "astropy is required for combine_fits_masks. "
+            "Install with: pip install 'spikeout[astropy]'"
+        )
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kw):
+            return it
+
+    input_paths = list(input_paths)
+    if not input_paths:
+        raise ValueError("at least one input path is required")
+    if operation not in ('or', 'and'):
+        raise ValueError(f"operation must be 'or' or 'and'; got {operation!r}")
+    if hdu_indices is None:
+        hdu_indices = [0] * len(input_paths)
+    if len(hdu_indices) != len(input_paths):
+        raise ValueError("hdu_indices must have the same length as input_paths")
+
+    # ── Read headers, validate dimensions, open memmaps ──────────────────
+    header0 = _fits.getheader(input_paths[0], ext=hdu_indices[0])
+    full_wcs = _WCS(header0)
+    H = int(header0['NAXIS2'])
+    W = int(header0['NAXIS1'])
+
+    in_fits = [_fits.open(p, memmap=True) for p in input_paths]
+    in_data = []
+    for i, (fh, hi) in enumerate(zip(in_fits, hdu_indices)):
+        d = fh[hi].data
+        if d.shape != (H, W):
+            for f in in_fits:
+                f.close()
+            raise ValueError(
+                f"input_paths[{i}] has shape {d.shape}, expected ({H}, {W})"
+            )
+        in_data.append(d)
+
+    # ── Pre-allocate output FITS ──────────────────────────────────────────
+    fill = np.uint8(0) if operation == 'or' else np.uint8(1)
+    out_hdu = _fits.PrimaryHDU(data=np.full((H, W), fill, dtype=np.uint8))
+    out_hdu.header.update(full_wcs.to_header())
+    out_hdu.writeto(output_path, overwrite=True)
+    out_fits = _fits.open(output_path, mode='update', memmap=True)
+    out_data = out_fits[0].data
+
+    # ── Per-tile worker ───────────────────────────────────────────────────
+    def _process_tile(row0, col0):
+        row1 = min(row0 + tile_size, H)
+        col1 = min(col0 + tile_size, W)
+
+        # Read first tile as the accumulator; keep as uint8 throughout
+        tile = in_data[0][row0:row1, col0:col1].astype(np.uint8)
+
+        for d in in_data[1:]:
+            chunk = d[row0:row1, col0:col1]
+            if operation == 'or':
+                tile |= chunk
+            else:  # 'and'
+                tile &= chunk
+
+        out_data[row0:row1, col0:col1] = tile
+
+    # ── Parallel tile loop ────────────────────────────────────────────────
+    tiles = [
+        (r, c)
+        for r in range(0, H, tile_size)
+        for c in range(0, W, tile_size)
+    ]
+    max_workers = None if n_workers == -1 else n_workers
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_process_tile, r, c): (r, c) for r, c in tiles}
+            for fut in _tqdm(
+                as_completed(futures), total=len(futures), desc='Combining masks'
+            ):
+                fut.result()
+    finally:
+        out_fits.flush()
+        out_fits.close()
+        for fh in in_fits:
+            fh.close()
 
 
 def _write_reg_file(path, coordsys, regions, colour):

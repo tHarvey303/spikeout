@@ -171,3 +171,82 @@ class TestSpikeMask:
         n_narrow = spike_mask(result_with_lengths, star_centred.shape, **kw_narrow).sum()
         n_wide = spike_mask(result_with_lengths, star_centred.shape, **kw_wide).sum()
         assert n_wide > n_narrow
+
+
+# ── combine_masks ─────────────────────────────────────────────────────────────
+
+class TestCombineMasks:
+
+    def _pair(self, shape=(50, 50)):
+        a = np.zeros(shape, dtype=bool)
+        b = np.zeros(shape, dtype=bool)
+        a[10:20, 10:20] = True   # 100 pixels
+        b[15:25, 15:25] = True   # 100 pixels, partial overlap with a
+        return a, b
+
+    def test_or_union(self):
+        from spikeout.regions import combine_masks
+        a, b = self._pair()
+        c = combine_masks([a, b], operation='or')
+        # union must be at least as large as each input
+        assert c.sum() >= a.sum()
+        assert c.sum() >= b.sum()
+        # every pixel masked in a or b must be masked in c
+        assert np.all(c[a])
+        assert np.all(c[b])
+
+    def test_and_intersection(self):
+        from spikeout.regions import combine_masks
+        a, b = self._pair()
+        c = combine_masks([a, b], operation='and')
+        expected = a & b
+        np.testing.assert_array_equal(c, expected)
+
+    def test_xor(self):
+        from spikeout.regions import combine_masks
+        a, b = self._pair()
+        c = combine_masks([a, b], operation='xor')
+        np.testing.assert_array_equal(c, a ^ b)
+
+    def test_single_mask_returns_copy(self):
+        from spikeout.regions import combine_masks
+        a = np.ones((10, 10), dtype=bool)
+        c = combine_masks([a])
+        np.testing.assert_array_equal(c, a)
+        assert c is not a   # must be a copy
+
+    def test_dtype_is_bool(self):
+        from spikeout.regions import combine_masks
+        a, b = self._pair()
+        assert combine_masks([a, b]).dtype == bool
+
+    def test_shape_preserved(self):
+        from spikeout.regions import combine_masks
+        shape = (37, 53)
+        masks = [np.zeros(shape, dtype=bool) for _ in range(3)]
+        assert combine_masks(masks).shape == shape
+
+    def test_shape_mismatch_raises(self):
+        from spikeout.regions import combine_masks
+        a = np.zeros((10, 10), dtype=bool)
+        b = np.zeros((10, 11), dtype=bool)
+        with pytest.raises(ValueError, match="inconsistent"):
+            combine_masks([a, b])
+
+    def test_empty_raises(self):
+        from spikeout.regions import combine_masks
+        with pytest.raises(ValueError, match="at least one"):
+            combine_masks([])
+
+    def test_invalid_operation_raises(self):
+        from spikeout.regions import combine_masks
+        with pytest.raises(ValueError, match="operation"):
+            combine_masks([np.zeros((5, 5), dtype=bool)], operation='not')
+
+    def test_does_not_modify_inputs(self):
+        from spikeout.regions import combine_masks
+        a = np.zeros((10, 10), dtype=bool)
+        b = np.ones((10, 10), dtype=bool)
+        a_copy = a.copy()
+        combine_masks([a, b], operation='or')
+        np.testing.assert_array_equal(a, a_copy)
