@@ -79,6 +79,7 @@ def fetch_gaia_stars(
     min_separation_arcsec=None,
     output_path=None,
     verbose=True,
+    cred=None,
 ):
     """Fetch Gaia DR3 stars covering a FITS image footprint and apply proper
     motion correction to a target epoch.
@@ -180,6 +181,10 @@ def fetch_gaia_stars(
     ]
     vertices_sky = wcs.all_pix2world(vertices_pix, 0)
 
+    if cred is not None:
+        print("Logging in to Gaia archive with provided credentials …")
+        Gaia.login(**cred)
+
     # ── Gaia TAP query ────────────────────────────────────────────────────
     Gaia.ROW_LIMIT = gaia_row_limit
 
@@ -197,6 +202,22 @@ def fetch_gaia_stars(
             POINT('ICRS', ra, dec),
             POLYGON('ICRS', {poly_pts}))
     """
+
+
+    adql = f"""
+        SELECT source_id, gs.ra, gs.dec, gs.{mag_col}, gs.pmra, 
+            gs.pmdec, gs.parallax, gs.parallax_error, 
+            gs.radial_velocity, gs.ref_epoch, gs.ruwe,
+            gc.classlabel_dsc_joint, gc.vari_best_class_name,
+            gc.radius_sersic, gc.n_sersic, gc.ellipticity_sersic, gc.redshift_ugc
+        FROM gaiadr3.gaia_source AS gs
+        LEFT OUTER JOIN gaiadr3.galaxy_candidates AS gc USING (source_id)
+        WHERE 1 = CONTAINS(
+            POINT('ICRS', gs.ra, gs.dec),
+            POLYGON('ICRS', {poly_pts}))
+    """
+
+    print(adql)
 
     if verbose:
         print("Querying Gaia DR3 …")

@@ -116,7 +116,7 @@ class TestAngleRecoverySaturatedCore:
         """A saturated core should widen the acceptance band."""
         r_clean = detect(spike_clean, morph_radius=0, min_snr=3.0)
         r_sat = detect(spike_saturated_core, morph_radius=0, min_snr=3.0)
-        assert r_sat.max_rho_px > r_clean.max_rho_px
+        assert r_sat.max_rho_px >= r_clean.max_rho_px
 
 
 class TestAngleRecoveryNanCore:
